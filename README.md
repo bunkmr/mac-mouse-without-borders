@@ -5,6 +5,9 @@
 这是一个 macOS 客户端，可以直接连上 Windows 上 **Microsoft PowerToys → Mouse Without Borders（无界鼠标）** 的现有配置，
 把你的 Mac 加进这套键鼠共享里。**Windows 端不需要安装或改动任何东西**，继续用 PowerToys 里那个就行。
 
+> ### 📦 [**→ 点此下载最新版**](https://github.com/bunkmr/mac-mouse-without-borders/releases/latest)
+> macOS 13+ ｜ Intel 与 Apple Silicon 通用二进制，一份安装包通吃 ｜ 约 1.5 MB
+
 ![配置界面](docs/panel.png)
 
 ---
@@ -56,7 +59,9 @@ Windows 上的「无界鼠标」只能让 Windows 电脑之间互联。这个程
 
 ### 第 1 步：下载
 
-👉 **[下载 dist/MWB-v1.3-universal.dmg](dist/MWB-v1.3-universal.dmg)**（约 1.5 MB）
+👉 **前往 [Releases 页面](https://github.com/bunkmr/mac-mouse-without-borders/releases/latest) 下载 `MWB-v1.3-universal.dmg`**（约 1.5 MB）
+
+也可以直接下仓库里的那份：[dist/MWB-v1.3-universal.dmg](dist/MWB-v1.3-universal.dmg)。
 
 ### 第 2 步：安装
 
