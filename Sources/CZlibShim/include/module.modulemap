@@ -1,0 +1,12 @@
+// 显式 modulemap。
+//
+// 【为什么必须显式写】本工程在 Resilio 同步卷上，文件系统不支持 xattr，
+// 于是每个文件旁边都会多出一个 AppleDouble 元数据文件（._mwb_zlib.h 等）。
+// SwiftPM 自动生成 modulemap 时用 <module-includes> 去 glob 整个 include 目录，
+// 会把 ._mwb_zlib.h 也当源码文件喂给 Clang（非 UTF-8，直接报错）。
+// 显式声明 header 后 Clang 只解析这一个头文件，彻底绕开该问题。
+module CZlibShim {
+    header "mwb_zlib.h"
+    link "z"
+    export *
+}

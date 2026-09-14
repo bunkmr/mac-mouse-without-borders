@@ -1,0 +1,23 @@
+# ---- 构建产物 ----
+.build/
+/tmp/
+*.o
+*.dSYM/
+*.cstemp*
+.built/
+
+# ---- 命令行调试版 ----
+bin/
+
+# ---- 截图画廊（不发布）----
+preview/
+
+# ---- macOS / 同步卷垃圾 ----
+.DS_Store
+._*
+**/.DS_Store
+
+# ---- 编辑器 ----
+.idea/
+.vscode/
+*.swp

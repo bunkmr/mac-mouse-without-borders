@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>MWB</string>
+    <key>CFBundleDisplayName</key>
+    <string>MWB</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.laozhao.mwb</string>
+    <key>CFBundleVersion</key>
+    <string>4</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.3</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleExecutable</key>
+    <string>MWBMacClientApp</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <!-- 禁掉 App Nap / 定时器合并。
+         这是个常驻菜单栏应用，用户不在前台点击时系统会把它 App Nap 掉：
+         定时器被合并、线程调度被降频，表现就是鼠标跨屏"一顿一顿、延时闪烁"。
+         键鼠共享这类低延迟交互工具必须显式关闭它。 -->
+    <key>NSAppSleepDisabled</key>
+    <true/>
+
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+
+    <key>NSAccessibilityUsageDescription</key>
+    <string>需要「辅助功能」与「输入监控」权限，以注入与捕获键鼠输入，实现跨设备共享。</string>
+
+    <!-- 关键：macOS 15 (Sequoia) 起访问局域网需要「本地网络」隐私权限。
+         缺这条声明时系统不会弹授权窗，BSD socket 连接被静默拦截，
+         现象是「命令行能连、App 连不上，报超时或被拒绝」。 -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>需要访问局域网，才能连接 Windows 上的 Mouse Without Borders（键鼠跨屏与文件传输）</string>
+</dict>
+</plist>
