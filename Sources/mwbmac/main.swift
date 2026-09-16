@@ -7,11 +7,132 @@ import Foundation
 import MWBMacClientCore
 import SystemConfiguration
 import Darwin
+import AppKit
 
 // 无缓冲 stdout，避免被外部 kill 时丢失日志（管道下 Swift print 默认块缓冲）
 setvbuf(stdout, nil, Int32(_IONBF), 0)
 
 let args = CommandLine.arguments
+
+// MARK: - 剪贴板打包串离线自测
+//
+// 用法: mwbmac --clip-bundle-selftest
+//
+// 纯离线断言：不碰系统剪贴板、不联网、不启动 UI。
+// 核心用例是用户 2026-09-16 实际粘贴出来的那条乱码原文 —— 拆包后必须只剩干净的纯文本。
+if args.count > 1 && args[1] == "--clip-bundle-selftest" {
+    let SEP = MWBClipboardBundle.separator
+    var pass = 0, fail = 0
+    func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+        if ok { pass += 1; print("  ✓ \(name)") }
+        else { fail += 1; print("  ✗ \(name)" + (detail.isEmpty ? "" : "  → " + detail)) }
+    }
+
+    print("剪贴板打包串自测（分隔符 \(SEP)）\n")
+
+    print("[1] 用户实际报的乱码原串")
+    let garbled = "TXT昨天整理了一下 帮忙看看有什么问题吗" + SEP
+        + "HTMVersion:0.9\nStartHTML:0000000117\nEndHTML:0000000246\n"
+        + "StartFragment:0000000153\nEndFragment:0000000210\nSourceURL:\n"
+        + "<html>\n<body>\n<!--StartFragment-->昨天整理了一下&nbsp;帮忙看看有什么问题吗<!--EndFragment-->\n</body>\n</html>"
+        + SEP
+    let g = MWBClipboardBundle.parse(garbled)
+    check("纯文本 = 原文", g.text == "昨天整理了一下 帮忙看看有什么问题吗", "得到 \(g.text ?? "nil")")
+    check("不含 TXT 前缀", !(g.text ?? "").hasPrefix("TXT"))
+    check("不含分隔符 GUID", !(g.text ?? "").contains(SEP))
+    check("HTML 已剥掉 CF_HTML 头", !(g.html ?? "").contains("Version:0.9"),
+          "得到 \(g.html?.prefix(30) ?? "nil")")
+    check("HTML 从 <html> 开始", (g.html ?? "").hasPrefix("<html>"))
+    check("已识别为打包串", g.sawTaggedEntry)
+
+    print("\n[2] 打包 → 拆包 往返")
+    let packed = MWBClipboardBundle.pack(text: "勾选保留理由",
+                                         html: "<html><body>勾选保留理由</body></html>",
+                                         rtf: "{\\rtf1 勾选}")
+    check("打包串以 TXT 条目开头", (packed ?? "").hasPrefix("TXT勾选保留理由" + SEP),
+          "得到 \(packed?.prefix(20) ?? "nil")")
+    let rt = MWBClipboardBundle.parse(packed ?? "")
+    check("往返 纯文本", rt.text == "勾选保留理由", "得到 \(rt.text ?? "nil")")
+    check("往返 HTML", rt.html == "<html><body>勾选保留理由</body></html>", "得到 \(rt.html ?? "nil")")
+    check("往返 RTF", rt.rtf == "{\\rtf1 勾选}", "得到 \(rt.rtf ?? "nil")")
+
+    print("\n[3] 边界：裸文本（无分隔符）绝不能被砍掉前 3 个字符")
+    for raw in ["HTM是超文本标记语言", "TXT文件说明", "RTF是什么东西", "普通一句话"] {
+        let p = MWBClipboardBundle.parse(raw)
+        check("「\(raw)」原样保留", p.text == raw, "得到 \(p.text ?? "nil")")
+        check("「\(raw)」未被误判成打包串", !p.sawTaggedEntry)
+    }
+
+    print("\n[4] 边界：只有 HTM 条目、没有 TXT")
+    let htmlOnly = "HTM<html><body>只有网页版<br>第二行</body></html>" + SEP
+    let h = MWBClipboardBundle.parse(htmlOnly)
+    let fallback = MWBClipboardBundle.plainText(fromHTML: h.html ?? "")
+    check("text 为 nil（确实没有 TXT）", h.text == nil)
+    check("从 HTML 兜底出纯文本", fallback.contains("只有网页版") && fallback.contains("第二行"),
+          "得到 \(fallback)")
+
+    print("\n[5] 边界：空串 / 只有分隔符")
+    check("空串 → 无内容", MWBClipboardBundle.parse("").isEmpty)
+    check("只有分隔符 → 无内容", MWBClipboardBundle.parse(SEP + SEP).isEmpty)
+
+    print("\n结果: \(pass) 通过, \(fail) 失败")
+    exit(fail == 0 ? 0 : 2)
+}
+
+// MARK: - 剪贴板写入自测（真机 pasteboard 往返）
+//
+// 用法: mwbmac --clip-write-selftest
+//
+// 把「拆包 → 写本机剪贴板 → 读回」这条真实链路跑一遍（只跳过 socket）：
+// 这是整条接收链里最容易出错、也最该实测的一步 —— 多类型同时写进去之后，
+// 纯文本框到底还能不能读到干净文字、HTML 是不是真的成了 public.html。
+//
+// 【副作用】会短暂占用系统剪贴板（写入→读回→还原原字符串，毫秒级窗口）。
+// 只能还原纯文本部分，其他类型不还原 —— 这是自测，不是给用户用的功能。
+if args.count > 1 && args[1] == "--clip-write-selftest" {
+    let pb = NSPasteboard.general
+    let savedString = pb.string(forType: .string)
+    let savedTypes = (pb.types ?? []).map { $0.rawValue }
+
+    let SEP = MWBClipboardBundle.separator
+    let garbled = "TXT昨天整理了一下 帮忙看看有什么问题吗" + SEP
+        + "HTMVersion:0.9\nStartHTML:0000000117\nEndHTML:0000000246\n"
+        + "StartFragment:0000000153\nEndFragment:0000000210\nSourceURL:\n"
+        + "<html>\n<body>\n<!--StartFragment-->昨天整理了一下&nbsp;帮忙看看有什么问题吗<!--EndFragment-->\n</body>\n</html>"
+        + SEP
+
+    var pass = 0, fail = 0
+    func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+        if ok { pass += 1; print("  ✓ \(name)") }
+        else { fail += 1; print("  ✗ \(name)" + (detail.isEmpty ? "" : "  → " + detail)) }
+    }
+
+    print("剪贴板写入自测（真机 pasteboard）")
+    print("写入前类型: \(savedTypes.joined(separator: ", "))\n")
+
+    let sync = ClipboardSync.shared
+    sync.writeBundle(MWBClipboardBundle.parse(garbled))
+
+    let outTypes = (pb.types ?? []).map { $0.rawValue }
+    let outString = pb.string(forType: .string)
+    let outHTML = pb.data(forType: .html).flatMap { String(data: $0, encoding: .utf8) }
+
+    print("写入后类型: \(outTypes.joined(separator: ", "))\n")
+    check("纯文本 = 原文", outString == "昨天整理了一下 帮忙看看有什么问题吗", "得到 \(outString ?? "nil")")
+    check("纯文本不含 TXT 前缀", !(outString ?? "").hasPrefix("TXT"))
+    check("纯文本不含分隔符 GUID", !(outString ?? "").contains(SEP))
+    check("带上了 public.html 类型", outTypes.contains("public.html"))
+    check("HTML 从 <html> 开始", (outHTML ?? "").hasPrefix("<html>"), "得到 \(outHTML?.prefix(25) ?? "nil")")
+    check("HTML 不含 CF_HTML 头", !(outHTML ?? "").contains("Version:0.9"))
+
+    // 还原（只能还原纯文本）
+    pb.clearContents()
+    if let s = savedString { pb.setString(s, forType: .string) }
+
+    print("\n结果: \(pass) 通过, \(fail) 失败（原剪贴板纯文本已还原）")
+    exit(fail == 0 ? 0 : 2)
+}
+
 guard args.count >= 4 else {
     fputs("用法: mwbmac <windows-host> <port> <securityKey> [machineName] [myID]\n", stderr)
     exit(1)

@@ -29,7 +29,7 @@ Windows 上的「无界鼠标」只能让 Windows 电脑之间互联。这个程
 | 🖱️ 一套键鼠控制两台电脑 | 鼠标撞到屏幕边缘即切换，键盘自动跟随 |
 | 🔁 双向控制 | Mac 控 Windows、Windows 控 Mac 都支持 |
 | 🚫 本机光标自动锁定 | 控制另一台时，本机光标自动隐藏，不会两边乱跑 |
-| 📋 剪贴板文字同步 | 一边复制，另一边直接粘贴 |
+| 📋 剪贴板同步（文字 + 富文本） | 一边复制，另一边直接粘；网页 / 微信里的富文本粘到 Word 能保留格式 |
 | 📁 拖放文件（Mac → Windows） | 把文件拖到屏幕边缘松手就发过去 |
 | 📁 拖放文件（Windows → Mac） | 从 Windows 拖过来，自动保存并弹出访达选中该文件 |
 | ⌘ 访达复制即传 | 在访达里 `Cmd+C` 复制文件，自动同步到 Windows |
@@ -59,9 +59,9 @@ Windows 上的「无界鼠标」只能让 Windows 电脑之间互联。这个程
 
 ### 第 1 步：下载
 
-👉 **前往 [Releases 页面](https://github.com/bunkmr/mac-mouse-without-borders/releases/latest) 下载 `MWB-v1.3-universal.dmg`**（约 1.5 MB）
+👉 **前往 [Releases 页面](https://github.com/bunkmr/mac-mouse-without-borders/releases/latest) 下载 `MWB-v1.4-universal.dmg`**（约 1.5 MB）
 
-也可以直接下仓库里的那份：[dist/MWB-v1.3-universal.dmg](dist/MWB-v1.3-universal.dmg)。
+也可以直接下仓库里的那份：[dist/MWB-v1.4-universal.dmg](dist/MWB-v1.4-universal.dmg)。
 
 ### 第 2 步：安装
 
@@ -122,6 +122,26 @@ xattr -dr com.apple.quarantine /Applications/MWB.app
 
 之后把鼠标往那个方向撞到屏幕边缘，就切到 Windows 了；反方向推回来就切回 Mac。
 也可以按 `Control + Option + Esc` 强制把控制权收回 Mac。
+
+---
+
+## 更新记录
+
+### v1.4（2026-09-16）
+
+- 🐛 **修复剪贴板粘出来是乱码**：从 Windows 复制文字过来，偶尔会夹带一长串
+  `{4CFF57F7-…}` 分隔符和 `Version:0.9 / StartHTML:…` 之类的 HTML 源码残渣
+  （在企业微信、浏览器等复制富文本时最容易出现）。现在会正确识别剪贴板包，
+  只取出干净的文字。
+- ✨ 顺带支持**富文本**：网页 / 微信里复制的带格式内容，粘到 Word、邮件里
+  能保留格式，粘到纯文本框仍是干净文字 —— 和 Windows 原生一样。
+- 🐛 修复 Mac → Windows 复制时，内容刚好以 `TXT` / `HTM` / `RTF` 开头会少掉
+  前 3 个字的问题。
+
+### v1.3（2026-09-14）
+
+- 首个发布版：一套键鼠控制两台电脑、本机光标自动锁定、剪贴板同步、
+  文件拖放（双向）、访达复制即传、屏幕方位可配。
 
 ---
 
@@ -216,7 +236,7 @@ no extra software needed on the Windows side.
 
 **Install**
 
-1. Download `dist/MWB-v1.3-universal.dmg`
+1. Download `dist/MWB-v1.4-universal.dmg`
 2. Drag `MWB.app` into `/Applications`
 3. The app is not notarized, so run once:
    ```bash
