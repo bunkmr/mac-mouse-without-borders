@@ -41,6 +41,12 @@ public final class MWBClient {
     /// Hi 包日志限流（Windows 在拖放/切机器时会一秒连发十几个，原样打印会冲爆面板）。
     private var hiLogCount = 0
     private var lastHiLogAt = Date.distantPast
+    /// 上一次「因为对端心跳包 Clipboard(69) 而去拉大剪贴板」的时间（3 秒去重）。
+    private var lastBigClipboardPullAt: Date?
+    /// 最近一次「对端宣布它剪贴板里有大数据」的时间（心跳包 Clipboard(69) / 切机通知 MachineSwitched）。
+    /// 对齐 PowerToys `Clipboard.BIG_CLIPBOARD_DATA_TIMEOUT = 30000`：超过 30 秒就不再回连去拉，
+    /// 免得对着一个早失效的心跳白发一轮连接、刷一屏失败日志。
+    private var lastBigClipboardBeatAt: Date?
     /// 屏幕边缘投放带（拖文件过去即发送）
     private let dropPanel = EdgeDropPanel()
     private var lastClipFiles: [String] = []
@@ -88,6 +94,85 @@ public final class MWBClient {
 
     // MARK: - 链路看门狗
 
+    // MARK: - 鼠标移动包：合流 + 独立发送线程
+
+    /// 鼠标移动包的「最新值信箱」（见 `MouseMoveMailbox.swift`）。
+    let mouseMailbox = MouseMoveMailbox()
+    /// 移动包是否走**异步合流**（默认开）。
+    ///
+    /// `MWB_MOUSE_ASYNC=0` 关掉它 → 回到"在事件 tap 回调里同步写 socket"的老行为。
+    /// 保留这个开关的唯一目的是**做对照实验**：CPU 这种指标受采样噪声影响很大，
+    /// 只有"同一份二进制、交替跑 A/B"得到的差值才可信（本项目已多次被噪声误导）。
+    let mouseAsyncSend = ProcessInfo.processInfo.environment["MWB_MOUSE_ASYNC"] != "0"
+    /// 唤醒发送线程的信号量。只在信箱"空 → 非空"时 signal 一次。
+    let mouseMailboxSignal = DispatchSemaphore(value: 0)
+    private var mouseSenderThread: Thread?
+    /// 发送线程的**代际号**（只增不减）。
+    ///
+    /// 【为什么不能用 Bool】与本项目捕获线程踩过的坑一模一样：`startMouseMoveSender()`
+    /// 第一行就调 `stopMouseMoveSender()`，若用 Bool 就是"设 true → 立刻设回 false"，
+    /// 而旧线程此刻多半还阻塞在信号量上，醒来读到的已经是被重置的 false →
+    /// **旧线程永不退出**，下一次进入远端就会有两个发送线程同时写同一条 socket。
+    /// 代际号让旧线程无论如何都能识别出"我不是当代"。
+    private var mouseSenderGeneration = 0
+    /// 上次汇报合流效果的时刻 / 当时的合并计数（每 5 秒最多汇报一次，且只在真的合并过时才打）。
+    private var mouseMailboxReportAt = Date.distantPast
+    private var mouseMailboxReportedCoalesced = 0
+
+    /// 起一条**专门发鼠标移动包**的线程。
+    ///
+    /// 【为什么是独立线程而不是 GCD 队列】发送必须严格串行（CBC 链式加密 + socket 字节流
+    /// 不允许交错），一条常驻线程最省事也最可预期；`connection.send` 内部还有 `sendLock`
+    /// 兜住与其它线程（剪贴板/按键/心跳）的并发写。
+    ///
+    /// 【为什么 `userInteractive`】这一条线程直接决定远端光标的跟手程度，
+    /// 必须能抢到 CPU，不能排在后台任务后面。
+    private func startMouseMoveSender() {
+        stopMouseMoveSender()
+        mouseSenderGeneration += 1
+        let gen = mouseSenderGeneration
+        let t = Thread { [weak self] in
+            while let s0 = self, s0.mouseSenderGeneration == gen {
+                s0.mouseMailboxSignal.wait()
+                // 一次唤醒把信箱取干：取的永远是"当下最新"的那一帧，
+                // 中间被顶掉的帧不会发出去（这正是省 CPU 的地方）。
+                while let s = self, s.mouseSenderGeneration == gen,
+                      let p = s.mouseMailbox.takeLatest() {
+                    if case .failure(let e) = s.connection.send(p) {
+                        s.handleSendFailure(e)
+                        break               // 链路有问题时别再闷头发，交给看门狗
+                    }
+                    s.sendFailStreak = 0
+                    s.reportMouseMailboxIfNeeded()
+                }
+            }
+        }
+        t.name = "MWBMouseSend"
+        t.qualityOfService = .userInteractive
+        mouseSenderThread = t
+        t.start()
+    }
+
+    private func stopMouseMoveSender() {
+        mouseSenderGeneration += 1           // 旧线程看到代号变了就退出
+        mouseMailbox.discardPending()        // 过期的位置不要再打扰对端
+        mouseMailboxSignal.signal()          // 让阻塞在 wait 上的线程醒来看一眼代号
+        mouseSenderThread = nil
+    }
+
+    /// 每 5 秒最多汇报一次"合流省掉了多少帧"——用来确认这套机制真的在起作用。
+    /// 只在**合并计数有增长**时才打，避免安静时刷屏。
+    private func reportMouseMailboxIfNeeded() {
+        let now = Date()
+        guard now.timeIntervalSince(mouseMailboxReportAt) > 5 else { return }
+        let c = mouseMailbox.coalesced
+        guard c > mouseMailboxReportedCoalesced else { return }
+        mouseMailboxReportAt = now
+        mouseMailboxReportedCoalesced = c
+        log("[MWB] 鼠标移动包合流：\(mouseMailbox.summary)"
+            + " —— 发送线程只顾得上发最新的，过期位置直接丢掉（不阻塞事件 tap）")
+    }
+
     /// 统一处理发送失败：限流打日志 + 连续失败到阈值就判定链路死亡。
     ///
     /// 【为什么不能只打一行日志了事】`writeRaw` 返回 `.writeFailed` 时，socket 在
@@ -127,6 +212,9 @@ public final class MWBClient {
         }
         guard !linkDead else { return }
         linkDead = true
+        // 链路已死：停掉鼠标发送线程，别让它在死 socket 上继续闷头发。
+        // （重连成功后 run() 会重新起一条。）
+        stopMouseMoveSender()
         log("[MWB] ✗ \(reason) → 立即把控制权交回 Mac，并开始自动重连…")
         input.forceReleaseRemote(reason: reason)
         // 断链时清掉拖放态：否则"陈旧的投放态"会让恢复连接后的第一次左键抬起
@@ -297,10 +385,14 @@ public final class MWBClient {
         // 心跳保活：周期性广播 HeartbeatEx 维持机器矩阵（Windows 也会发心跳，我们回显）
         startHeartbeat()
 
-        // 剪贴板文本同步（走 MWB 原生协议：UTF-16LE + 裸 DEFLATE + 48 字节分片，主 socket 直推）
+        // 剪贴板同步（走 MWB 原生协议：文本 = UTF-16LE + 裸 DEFLATE + 48 字节分片；
+        // 图片 = PNG 原始字节 + 48 字节分片；超过 1MB 改发 Clipboard(69) 心跳让对端来拉）
         clipboard.onLog = { [weak self] s in self?.log("[MWB] \(s)") }
         clipboard.onLocalText = { [weak self] text in
             self?.sendClipboardText(text)
+        }
+        clipboard.onLocalImage = { [weak self] png in
+            self?.sendClipboardImage(png)
         }
         clipboard.startMonitoring()
 
@@ -322,6 +414,22 @@ public final class MWBClient {
                     ? "flags=0x\(String(format: "%x", packet.mouseFlags)) x=\(packet.mouseX) y=\(packet.mouseY)"
                     : "vk=0x\(String(format: "%x", packet.keyVk)) flags=\(packet.keyFlags)"
                 self.log("[MWB] → \(packet.type) \(detail)")
+            }
+            // ★ 鼠标**移动**包走信箱（异步、只留最新一帧），**绝不在这里同步写 socket**。
+            //
+            // 【为什么必须分开】这个闭包是在 **CGEventTap 回调线程**上跑的（移动包直接来自
+            //  `handleMouseMoved`），也在**主线程**上跑（5ms 补发定时器）。而 `connection.send`
+            //  最终是 `CFWriteStreamWrite` —— 阻塞写，写超时 2s。放在这里意味着：
+            //    · 链路一抖（本机 WiFi 实测每 500ms 一次 60~85ms 尖峰），tap 回调就被同步写卡住，
+            //      系统在等我们返回 → **整个输入流一起停顿**（"跨屏一顿一顿、不跟手"的根因之一）；
+            //    · 主线程被卡住时，连"补发最后一帧"的定时器、面板刷新都会一起停。
+            //  移动包的位置是幂等的，合并掉过期帧没有任何副作用；点击/滚轮/按键包则照旧
+            //  同步发出（它们必须保序、不能丢，而且速率是人的手速，不构成压力）。
+            if self.mouseAsyncSend,
+               packet.type == .mouse, packet.mouseFlags == InputController.mouseMoveFlag {
+                // 只有"空 → 非空"这一次要唤醒发送线程：信箱非空时它本来就会一直取。
+                if !self.mouseMailbox.submit(packet) { self.mouseMailboxSignal.signal() }
+                return
             }
             // 发送失败：交给看门狗统一处理（限流打日志；连续失败则判定链路死亡、
             // 交回控制权并自动重连）。成功后清零连续失败计数。
@@ -349,6 +457,10 @@ public final class MWBClient {
 
         // 开始接收循环
         connection.startReceiveLoop()
+
+        // 鼠标移动包改由**独立线程**异步发送（信箱只留最新一帧）——
+        // 必须在 run() 末尾起：此时连接、密钥、socket 都已就绪。
+        startMouseMoveSender()
         return .success(())
     }
 
@@ -378,15 +490,27 @@ public final class MWBClient {
                                      myID: connection.myID)
         ch.magic = connection.learnedMagic
         ch.onLog = { [weak self] s in self?.log(s) }
-        ch.onFileReceived = { [weak self] url in
-            // 统一走 handleReceivedFile：日志 + 打开所在文件夹并选中该文件。
-            self?.handleReceivedFile(url)
+        ch.onPayloadReceived = { [weak self] payload in
+            guard let self else { return }
+            // 三种载荷分流：文件 → 原有收尾（Finder 定位）；图片/文本 → 交给 ClipboardSync 写板。
+            // ★ 文本载荷（*text）走的是 15100 通道，是与主通道分片**完全等价**的另一种封装，
+            //   所以这里必须复用同一个解压/拆包函数，不能另写一套。
+            switch payload {
+            case .file(let url):
+                self.handleReceivedFile(url)
+            case .image(let png):
+                _ = self.clipboard.acceptRemoteImage(png)
+            case .textWire(let bytes):
+                _ = self.clipboard.acceptRemoteWireText(bytes)
+            }
         }
         fileTransfer.channel = ch
         fileTransfer.signalDragDrop = { [weak self] url in self?.signalDragDropToPeer(url) }
         clipboardChannel = ch
-        // Windows 要主动来拉文件，所以必须监听；即使投放带关了也开（Cmd+C 复制文件那条路也用它）
-        if dropDockEnabled || clipboardFileEnabled { ch.startListener() }
+        // Windows 要主动来拉文件/大剪贴板，所以必须监听。
+        // ★ 现在**无条件开**：除了拖放与 Cmd+C 复制文件，还多了一条「大剪贴板图片/文本」的
+        //   拉取通道 —— 只要对方发过 Clipboard(69) 心跳，它就会回连我们的 15100。
+        ch.startListener()
 
         // 边缘投放带（AppKit 必须在主线程初始化）
         if dropDockEnabled {
@@ -423,12 +547,63 @@ public final class MWBClient {
         // 用法（注意别用 launchctl setenv —— 非特权上下文会报
         // "Not privileged to set domain environment"）：
         //   pkill -x MWBMacClientApp
-        //   open /Applications/MWB.app --env MWB_LOCK_SELFTEST=8
+        //   MWB_LOCK_SELFTEST=8 /Applications/MWB.app/Contents/MacOS/MWBMacClientApp
         //   /tmp/cursorwatch 14          # 进程外的只读判据，两侧都对上才算过
+        //
+        // 【⚠️ 不要用 `open --env`】2026-09-16 实测：本机 macOS 15.2 上
+        // `open --env K=V /Applications/MWB.app`（选项放前面、放后面都试过）
+        // **环境变量传不进被测进程**，钩子静默不触发 —— 会让你误判"自检通过"。
+        // 必须像上面那样直接跑 bundle 里的可执行文件（shell 直接继承 env）。
+        // 代价：这样起的实例归调用方 shell 管，命令一结束就被回收，
+        // 所以只适合自检；自检完用 `open /Applications/MWB.app` 起回正常实例。
         if let s = env["MWB_LOCK_SELFTEST"] {
             let secs = Double(s) ?? 8.0
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                 self?.input.runLockSelfTest(seconds: secs)
+            }
+        }
+
+        // 捕获线程泄漏（CPU 100%）回归自检钩子：MWB_CAPTURE_REBUILD_SELFTEST=<秒数>（默认 5）。
+        //
+        // 【为什么需要】2026-09-16 定位到一个「MWB 常量占满一个 CPU 核」的 bug：
+        // 捕获线程原来用共享 Bool 做取消标志，stopCapture() 置 true 后
+        // startCapture() 立刻置回 false，旧线程读到时已是 false → **永不退出**；
+        // 且它的 tap 已被 invalidate、runloop 里没有源，CFRunLoopRunInMode 因 mode 为空
+        // **立即返回**（不阻塞）→ while 变成纯空转。
+        // 触发条件是「同一进程内 startCapture 被调用第二次」，而这只在**断线重连**时发生，
+        // 人肉很难稳定复现（当时是一次 11:10 的重连后残留了 3 小时）。
+        // 这个钩子直接重放该路径：stopCapture → startCapture。
+        //
+        // 判据（两条都要）：
+        //   ① 日志出现 `输入捕获线程 #N 已退出（被新一代取代）` —— 旧线程真的退了；
+        //   ② 后面的 `活着的捕获线程=1`（不是 2）。
+        // 外部再用 `sample <pid> 3` 复核：应只有一个 MWBCapture 线程且停在 mach_msg。
+        //
+        // 用法（**不能用 `open --env`，实测传不进去**，见上面 MWB_LOCK_SELFTEST 的说明）：
+        //   pkill -x MWBMacClientApp
+        //   MWB_CAPTURE_REBUILD_SELFTEST=3 /Applications/MWB.app/Contents/MacOS/MWBMacClientApp
+        //
+        // 2026-09-16 实测结论（修复后）：
+        //   [自测] 重建前 活着的捕获线程=1
+        //   输入捕获线程 #2 已退出（被新一代取代） 当前活着的捕获线程=0   ← 同一毫秒退出
+        //   [自测] 重建后 活着的捕获线程=1 —— ✅ 通过（旧线程已退出，无泄漏）
+        // 修复前同一路径会留下 2 个线程，其中一个空转吃满一个核（见 liveCaptureThreadCount 注释）。
+        if let s = env["MWB_CAPTURE_REBUILD_SELFTEST"] {
+            let delay = Double(s) ?? 5.0
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                self.log("[MWB] [自测] MWB_CAPTURE_REBUILD_SELFTEST：模拟重连重建事件捕获"
+                         + "（stopCapture → startCapture）"
+                         + " 重建前 活着的捕获线程=\(self.input.liveCaptureThreadCount)")
+                self.input.stopCapture()
+                self.input.startCapture()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                    guard let self else { return }
+                    let n = self.input.liveCaptureThreadCount
+                    self.log("[MWB] [自测] 重建后 活着的捕获线程=\(n) —— "
+                             + (n == 1 ? "✅ 通过（旧线程已退出，无泄漏）"
+                                       : "❌ 失败（\(n) 个线程存活，会吃满 CPU）"))
+                }
             }
         }
 
@@ -614,6 +789,13 @@ public final class MWBClient {
     /// -> 最后一个 ClipboardDataEnd(76) 空包收尾（接收端到它才整体解压）。
     private func sendClipboardText(_ text: String) {
         guard let wire = clipboard.encodeForWire(text) else { return }
+        // >1MB（压缩后）别走 48 字节/片的直推：20 万个小包既慢又容易堵住链路。
+        // 对齐 PowerToys：改发心跳 Clipboard(69)，数据留在通道里等对端回连 15100 拉（一次 64KB）。
+        if wire.count > ClipboardSync.instantLimit {
+            clipboardChannel?.pendingClipboardPayload = .textWire(wire)
+            announceBigClipboard(reason: "文本压缩后 \(fmtBytes(Int64(wire.count))) 超过 1MB 即时推送阈值")
+            return
+        }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let chunk = 48
@@ -640,6 +822,117 @@ public final class MWBClient {
             }
             self.log("[MWB] [剪贴板] → 已发送 \(sent) 个分片（\(wire.count) 字节压缩数据）")
         }
+    }
+
+    /// 把一张图片按 MWB 协议推给 Windows。
+    ///
+    /// 【协议事实】图片载荷是 **PNG 原始字节，不做任何压缩/编码**
+    /// （PowerToys `FormHelper.cs`: `im.Save(ms, ImageFormat.Png)`），
+    /// 对端用 `Image.FromStream` 直接读 —— 所以必须是 PNG/JPEG 这类自带格式的图片流。
+    ///
+    /// 两条路（对齐 PowerToys `CheckClipboardEx` 的 1MB 阈值）：
+    ///   ≤ 1MB：48 字节/片 → 每片一个 ClipboardImage(125) 包 → ClipboardDataEnd(76) 收尾；
+    ///   > 1MB：48 字节一小包的效率太低（3MB 图 = 6 万多个包），改发 Clipboard(69) 心跳包，
+    ///          PNG 留在 `clipboardChannel.pendingClipboardPayload`，等对端回连 15100 拉走
+    ///          （那边一次 64KB，快两个数量级）。
+    private func sendClipboardImage(_ png: Data) {
+        guard png.count <= ClipboardSync.imageLimit else {
+            log("[MWB] [剪贴板] ⚠️ 图片过大（\(fmtBytes(Int64(png.count))) > 50MB），已跳过"
+                + "（对齐 PowerToys FormHelper.MAX_IMAGE_SIZE）")
+            return
+        }
+        if png.count > ClipboardSync.instantLimit {
+            clipboardChannel?.pendingClipboardPayload = .image(png)
+            announceBigClipboard(reason: "图片 \(fmtBytes(Int64(png.count))) 超过 1MB 即时推送阈值")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let chunks = ClipboardSync.chunk([UInt8](png))
+            var sent = 0
+            for c in chunks {
+                var p = DataPacket(type: .clipboardImage, src: self.connection.myID, des: 0xFF)
+                p.raw48 = c
+                if case .failure(let e) = self.connection.send(p) {
+                    self.handleSendFailure(e)
+                    return
+                }
+                sent += 1
+            }
+            let end = DataPacket(type: .clipboardDataEnd, src: self.connection.myID, des: 0xFF)
+            if case .failure(let e) = self.connection.send(end) {
+                self.handleSendFailure(e)
+                return
+            }
+            self.log("[MWB] [剪贴板] → 已发送图片 \(sent) 个分片（PNG \(fmtBytes(Int64(png.count)))）")
+        }
+    }
+
+    /// 广播 `Clipboard(69)` 心跳包：告诉对端「我剪贴板里有大块数据，你回来拉」。
+    ///
+    /// 对齐 PowerToys `Common.SendClipboardBeat()`（`SendPackage(ID.ALL, PackageType.Clipboard)`）。
+    /// 对端收到后会在切换机器时（Windows 侧 `MachineSwitched` → `GetRemoteClipboard`）
+    /// 回连我们的 15100 通道拉数据；拉不进来时会改发 `ClipboardAsk(78)` 让我们反向推。
+    private func announceBigClipboard(reason: String) {
+        var p = DataPacket(type: .clipboard, src: connection.myID, des: 0xFF)
+        p.machineName = connection.machineName
+        log("[MWB] [剪贴板] \(reason) —— 改发心跳包 Clipboard(69)，"
+            + "等对端回连 \(clipboardChannel?.port ?? 0) 拉取")
+        lastBigClipboardBeatAt = Date()
+        if case .failure(let e) = connection.send(p) { handleSendFailure(e) }
+    }
+
+    /// 对端发来 `Clipboard(69)` 心跳包 → 它剪贴板里有大块数据（>1MB 的图片/文本，
+    /// 或它 Cmd+C 复制的文件），我们主动去它的剪贴板通道拉回来。
+    ///
+    /// 对齐 PowerToys `Clipboard.GetRemoteClipboard`（它那边挂在 `MachineSwitched` 上，
+    /// 我们这里**直接拉**：数据早一点到，用户切过去时剪贴板已经就绪）。
+    ///
+    /// 去重：心跳触发 3 秒内只拉一次（避免对端连续心跳把连接打爆）；
+    /// `retry=true`（切机通知带来的一次补拉）只挡 0.5 秒 —— 首次拉取失败时它才有意义。
+    private func pullBigClipboardFromPeer(retry: Bool = false) {
+        guard let ch = clipboardChannel else { return }
+        let now = Date()
+        let guardWindow: TimeInterval = retry ? 0.5 : 3
+        if let last = lastBigClipboardPullAt, now.timeIntervalSince(last) < guardWindow { return }
+        lastBigClipboardPullAt = now
+        log("[MWB] [剪贴板] 对端宣布有大块剪贴板数据 → 主动去 \(host):\(ch.port) 拉取…"
+            + (retry ? "（切机补拉）" : ""))
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            switch ch.fetchPayload(from: self.host, postAction: .other) {
+            case .success(let payload):
+                switch payload {
+                case .image(let png):      _ = self.clipboard.acceptRemoteImage(png)
+                case .textWire(let bytes): _ = self.clipboard.acceptRemoteWireText(bytes)
+                case .file(let url):       self.handleReceivedFile(url)
+                }
+            case .failure(let e):
+                self.log("[MWB] [剪贴板] ✗ 拉取大剪贴板失败: \(e.localizedDescription)")
+            }
+        }
+    }
+
+    /// 把控制权交给 Windows 时调用（`input.onSwitchChanged(true)`）。
+    ///
+    /// ★ 补发 `MachineSwitched(77)` —— 这是 PowerToys 里 **"离开方通知接手方"** 的包，
+    ///   Windows 的 `Clipboard.GetRemoteClipboard` 就挂在它上面（`Receiver.cs` 的
+    ///   `case PackageType.MachineSwitched`：`Des == 自己` 且 30 秒内收到过心跳 → 去拉）。
+    ///
+    /// 没有这个包，**>1MB 的载荷永远到不了 Windows**：
+    ///   ≤1MB 我们走 48 字节/片直推（`ClipboardImage(125)` / `ClipboardText(124)`），
+    ///   >1MB 只能"发心跳 + 等对端来拉"，而对端唯一会来拉的时机就是这个包。
+    ///   真实照片基本都 >1MB，所以缺了它 = 大图必丢（这正是"照片过不去"的那一环）。
+    ///
+    /// 语义上我们是对的：交出控制权的是我们，Windows 是接手方 —— 与 PowerToys 一致。
+    public func handedControlToRemote() {
+        guard connection.myID != 0 else { return }
+        let target = (peerID == 0 || peerID == 0xFF) ? 0xFF : peerID
+        var p = DataPacket(type: .machineSwitched, src: connection.myID, des: target)
+        p.machineName = connection.machineName
+        log("[MWB] [剪贴板] 控制权交给 Windows → 补发 MachineSwitched(77)"
+            + (lastBigClipboardBeatAt != nil ? "（本机有刚复制的大载荷，等它回连 15100 拉）" : ""))
+        if case .failure(let e) = connection.send(p) { handleSendFailure(e) }
     }
 
     private func startReturnListener(machineID: UInt32) {
@@ -884,6 +1177,10 @@ public final class MWBClient {
     ///   对端既不应答握手、也不做 FIN 收尾 —— 典型"以为会话还在"的表现。
     ///   PowerToys 自己在退出时是会 `SendByeBye` 的，我们对齐它。
     public func stop() {
+        // ① 先停鼠标发送线程：否则 ByeBye 之后还可能冒出一帧过期位置，
+        //    对端会看到一个"已经道别了还在动"的机器。
+        stopMouseMoveSender()
+
         permissionWatchTimer?.cancel()
         permissionWatchTimer = nil
         dropWatchdog?.cancel()
@@ -913,7 +1210,59 @@ public final class MWBClient {
         input.releaseCursor()
     }
 
-    private func handle(_ p: DataPacket) {        if verbose {
+    // MARK: - 入站包节奏探针（`MWB_LATPROBE=1` 或存在 /tmp/mwb_latprobe 时启用）
+
+    /// 【它回答什么】"卡顿到底是不是网络"这个争论，用 MWB **自己的那条 TCP 加密流**来量。
+    ///
+    /// Windows 侧会持续发 Hi/心跳包（实测约 10 个/秒，很稳），所以入站包的**到达间隔**
+    /// 就是链路抖动的一个天然探针：若间隔里反复冒出 100ms+ 的空洞，说明链路在周期性停顿
+    /// （网卡/AP/TCP 重传）；若只有个位数 ms，则链路本身是干净的。
+    ///
+    /// 比 `ping` 更可信：ping 走 ICMP/UDP 且可能被对端防火墙屏蔽，而这里走的是
+    /// **与鼠标包完全相同的那一条 TCP 连接**，还顺带覆盖了 TCP 层的重传/队头阻塞。
+    private let inboundProbeOn = ProcessInfo.processInfo.environment["MWB_LATPROBE"] == "1"
+        || FileManager.default.fileExists(atPath: "/tmp/mwb_latprobe")
+    private var inboundFirstSeen = false
+    private var inboundCount = 0
+    private var inboundLastAt = Date.distantPast
+    private var inboundLastReportAt = Date.distantPast
+    private var inboundMaxGapMs = 0.0
+    private var inboundGapsOver100 = 0
+    private var inboundGapDesc = ""
+
+    private func noteInbound() {
+        guard inboundProbeOn else { return }
+        let now = Date()
+        if !inboundFirstSeen {
+            inboundFirstSeen = true
+            inboundLastAt = now
+            inboundLastReportAt = now
+            return
+        }
+        inboundCount += 1
+        let gap = now.timeIntervalSince(inboundLastAt)
+        inboundLastAt = now
+        if gap * 1000 > inboundMaxGapMs {
+            inboundMaxGapMs = gap * 1000
+            if gap > 0.1 { inboundGapDesc = String(format: "%.0fms", gap * 1000) }
+        }
+        if gap > 0.1 { inboundGapsOver100 += 1 }
+
+        let span = now.timeIntervalSince(inboundLastReportAt)
+        guard span >= 3 else { return }
+        log("【链路探针】\(Int(span))s内 收到 \(inboundCount) 包"
+            + " 最大到达间隔=\(Int(inboundMaxGapMs))ms(>100ms:\(inboundGapsOver100)次)"
+            + (inboundGapDesc.isEmpty ? "" : " 最大空洞=\(inboundGapDesc)"))
+        inboundCount = 0
+        inboundMaxGapMs = 0
+        inboundGapsOver100 = 0
+        inboundGapDesc = ""
+        inboundLastReportAt = now
+    }
+
+    private func handle(_ p: DataPacket) {
+        noteInbound()      // 链路探针：用 MWB 自己的 TCP 流的到达节奏量链路抖动
+        if verbose {
             log("[MWB] ← type=\(p.type) id=\(p.id) src=\(p.src) des=\(p.des) name='\(p.machineName)'")
         }
         // 对端发来的每个包都带着它的机器 ID，顺手记下来。
@@ -968,9 +1317,24 @@ public final class MWBClient {
             matrix.noteByeBye(name: p.machineName)
             connection.close()
 
-        case PackageType.hideMouse.rawValue, PackageType.machineSwitched.rawValue:
-            // HideMouse: 隐藏非活动机器上的光标；MachineSwitched: 通告当前活跃机器。
-            // 两者都由 Windows 侧主导，本机无需动作，静默即可（否则每几秒刷一次日志）。
+        case PackageType.hideMouse.rawValue:
+            // HideMouse: 隐藏非活动机器上的光标。由 Windows 侧主导，本机无需动作，静默即可。
+            break
+
+        case PackageType.machineSwitched.rawValue:
+            // MachineSwitched(77)：**离开方**通知「接手方」现在轮到它了。PowerToys 的
+            // `Clipboard.GetRemoteClipboard` 就挂在这个包上（`Receiver.cs` 里：
+            // `Des == 自己` 且 30 秒内收到过心跳 → 去拉对端剪贴板）。
+            //   · Windows 把控制权交给我们时 → Des=本机 ID → 我们去拉它的大载荷
+            //     （>1MB 的图片/文本，或它 Ctrl+C 复制的文件）；
+            //   · 我们交给 Windows 时由 `handedControlToRemote()` 反发同样的包。
+            // 没收到过心跳就不动（对齐 PowerToys `BIG_CLIPBOARD_DATA_TIMEOUT = 30s`），
+            // 也不打日志 —— 切机很频繁，保持安静（原注释的意图）。
+            if (p.des == connection.myID || p.des == 0xFF),
+               let beat = lastBigClipboardBeatAt,
+               Date().timeIntervalSince(beat) < 30 {
+                pullBigClipboardFromPeer(retry: true)
+            }
             break
 
         case PackageType.mouse.rawValue:
@@ -996,7 +1360,8 @@ public final class MWBClient {
                 dropWatchdog?.cancel()
                 dropWatchdog = nil
                 input.finishFileDrop()
-                input.injectMouseButton(flags: p.mouseFlags, nx: p.mouseX, ny: p.mouseY)
+                input.injectMouseButton(flags: p.mouseFlags, nx: p.mouseX, ny: p.mouseY,
+                                        xButton: p.mouseWheel)
                 fetchFileFromPeer()
                 break
             }
@@ -1016,7 +1381,8 @@ public final class MWBClient {
             } else if p.mouseFlags == WM_MOUSEMOVE {
                 input.injectMouseMove(nx: p.mouseX, ny: p.mouseY)
             } else {
-                input.injectMouseButton(flags: p.mouseFlags, nx: p.mouseX, ny: p.mouseY)
+                input.injectMouseButton(flags: p.mouseFlags, nx: p.mouseX, ny: p.mouseY,
+                                        xButton: p.mouseWheel)
             }
 
         case PackageType.keyboard.rawValue:
@@ -1024,25 +1390,52 @@ public final class MWBClient {
 
         case PackageType.clipboardText.rawValue:
             // 远端剪贴板文本分片（每片 48 字节，铺在 byte16..63）
-            clipboard.appendRemoteChunk(p.raw48)
+            clipboard.appendRemoteChunk(p.raw48, isImage: false)
 
         case PackageType.clipboardImage.rawValue:
-            // 图片剪贴板暂不支持：丢弃本批，别拿图像字节当文本解压
-            clipboard.dropPending()
+            // 远端剪贴板图片分片：同样是 byte16..63 铺 48 字节，但载荷是 **PNG 原始字节**，
+            // 不能拿去当文本解压 —— 用 isImage 标记分开累积，到 ClipboardDataEnd 再走图片分支。
+            clipboard.appendRemoteChunk(p.raw48, isImage: true)
 
         case PackageType.clipboardDataEnd.rawValue:
-            // 结束标记 —— 到这一刻才对整批数据解压并写入本机剪贴板
+            // 结束标记 —— 到这一刻才按批次类型整体处理（图片解码 / 文本解压拆包）
             clipboard.finishRemote()
+
+        case PackageType.clipboard.rawValue:
+            // ★ Clipboard(69) 是「剪贴板心跳包」：对端有**大块**剪贴板数据（>1MB 的图片/文本，
+            //   或它 Cmd+C 复制的文件），直推通道放不下，让我们回连它的 15100 拉。
+            //   以前这个包被并进下面的静默分支，于是「Win 上复制大图 → Mac 粘不出来」
+            //   且日志里毫无痕迹。
+            guard p.src != connection.myID else { break }   // 自己广播的不理
+            pullBigClipboardFromPeer()
 
         case PackageType.clipboardAsk.rawValue:
             // 对端（Windows）连不进我们的剪贴板通道，于是发 ClipboardAsk 让我们**反向推**过去。
             // 对称于 PowerToys Receiver.cs 的 ClipboardAsk 分支（它那边是 clientPushData = true）。
             guard p.des == connection.myID || p.des == 0xFF else { break }
-            guard let ch = clipboardChannel, let staged = ch.stagedFile else {
-                log("[MWB] [文件] 对端索要文件，但本机没有暂存文件（拖放信令与文件不同步？）")
+            guard let ch = clipboardChannel else { break }
+            let who = p.machineName.isEmpty ? peerName : p.machineName
+
+            // 大剪贴板载荷（图片/文本 >1MB）优先：它比暂存文件更"新"（刚复制的）。
+            if let payload = ch.pendingClipboardPayload {
+                log("[MWB] [剪贴板] 对端 \(who) 主动索要 → 反向推送剪贴板载荷"
+                    + "（\(fmtBytes(Int64(payload.byteCount)))）…")
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self else { return }
+                    switch ch.pushClipboardPayload(to: self.host) {
+                    case .success(let n):
+                        self.log("[MWB] [剪贴板] ✓ 剪贴板载荷反向推送完成（\(fmtBytes(n))）")
+                    case .failure(let e):
+                        self.log("[MWB] [剪贴板] ✗ 剪贴板载荷反向推送失败: \(e.localizedDescription)")
+                    }
+                }
                 break
             }
-            let who = p.machineName.isEmpty ? peerName : p.machineName
+
+            guard let staged = ch.stagedFile else {
+                log("[MWB] [文件] 对端索要数据，但本机既没有待推送剪贴板载荷也没有暂存文件")
+                break
+            }
             log("[MWB] [文件] 对端 \(who) 主动索要 → 反向推送 \(staged.lastPathComponent)…")
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else { return }
@@ -1095,10 +1488,10 @@ public final class MWBClient {
             log("[MWB] [文件] 收到 ExplorerDragDrop(72) —— 对端走的是旧式拖放信令"
                 + "（src=0x\(String(p.src, radix: 16)) des=0x\(String(p.des, radix: 16))）")
 
-        case PackageType.clipboard.rawValue, PackageType.clipboardPush.rawValue,
-             PackageType.clipboardCapture.rawValue:
-            // 这几类是「剪贴板次级 socket」上的包，走主 socket 时不该出现，静默即可
+        case PackageType.clipboardPush.rawValue, PackageType.clipboardCapture.rawValue:
+            // 这两类是「剪贴板次级 socket」上的包，走主 socket 时不该出现，静默即可
             // （以前会把它们打进「未处理包类型」刷屏）。
+            // 注意：Clipboard(69) 已单独处理（剪贴板心跳包），不在这里。
             break
 
         default:

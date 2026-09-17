@@ -36,7 +36,11 @@ public struct MachineSlot: Identifiable, Equatable {
 }
 
 /// 矩阵快照（GUI 渲染用，值类型，可安全跨线程传递）。
-public struct MatrixSnapshot {
+///
+/// `Equatable` 是给 GUI 的性能开关用的：健康轮询每 1.5 秒取一次快照，只有**真的变了**
+/// 才写回 `@Published` —— 否则每 1.5 秒都会触发一次全面板重算（实测那一次重算很贵，
+/// 见 `MouseButtonCard` 的说明）。所有成员都是值类型，合成实现即可。
+public struct MatrixSnapshot: Equatable {
     public var slots: [MachineSlot]
     /// 本机所在槽位（1..4）。nil = 还没确定
     public var selfSlot: Int?

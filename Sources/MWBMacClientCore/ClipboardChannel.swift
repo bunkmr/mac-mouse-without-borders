@@ -50,6 +50,42 @@
 import Foundation
 import Darwin
 
+// MARK: - 通道数据载荷
+
+/// 剪贴板通道上传输的三种载荷。
+///
+/// PowerToys 靠 1024 字节定长头里的「文件名」区分它们（`SocketStuff.SendClipboardData`）：
+///   - `"{字节数}*image"`  → 剪贴板图片（**PNG 原始字节**）
+///   - `"{字节数}*text"`   → 剪贴板文本（**DEFLATE 压缩后的多格式打包串**）
+///   - `"{字节数}*{真实路径}"` → 文件
+/// 判定用 `StartsWith("image"/"text", CurrentCultureIgnoreCase)`，所以这里也按前缀判。
+public enum MWBClipboardPayload {
+    /// 剪贴板图片：PNG 原始字节（线上就是这个，不再包一层）。
+    case image(Data)
+    /// 剪贴板文本：已经 DEFLATE 压缩过的打包串字节（交给 ClipboardSync 解压 + 拆包）。
+    case textWire([UInt8])
+    /// 文件：落盘后的本地 URL。
+    case file(URL)
+
+    /// 通道头里用的类型名。只对「内存型」载荷有意义。
+    public var wireName: String? {
+        switch self {
+        case .image:           return "image"
+        case .textWire:        return "text"
+        case .file:            return nil
+        }
+    }
+
+    public var isImage: Bool { if case .image = self { return true }; return false }
+    public var byteCount: Int {
+        switch self {
+        case .image(let d):     return d.count
+        case .textWire(let b):  return b.count
+        case .file:             return 0
+        }
+    }
+}
+
 // MARK: - 错误
 
 public enum MWBClipboardError: Error, LocalizedError {
@@ -106,13 +142,21 @@ public final class MWBClipboardChannel {
     public let port: UInt16
 
     public var onLog: ((String) -> Void)?
-    /// 收到对端推来的文件后回调（Windows → Mac 方向）。
-    public var onFileReceived: ((URL) -> Void)?
+    /// 收到对端推来的载荷后回调（Windows → Mac 方向）：文件 / 剪贴板图片 / 剪贴板文本。
+    public var onPayloadReceived: ((MWBClipboardPayload) -> Void)?
 
     /// 待发送的暂存文件（拖放时写入；对端来拉时读它）。
     /// ★ MWB 原生协议一次只传**一个**文件（`LastDragDropFile` 是单个字符串），
     ///   多文件/目录必须先打包成一个文件再发。
     public var stagedFile: URL?
+
+    /// 待发送的**大剪贴板载荷**（图片 > 1MB、或超大文本）。
+    ///
+    /// 【为什么需要它】超过 `Clipboard.MAX_CLIPBOARD_DATA_SIZE_CAN_BE_SENT_INSTANTLY_TCP`（1MB）
+    /// 时 PowerToys 不直推，而是发 `Clipboard(69)` 心跳包，等对端回连 15100 来拉。
+    /// 对端来拉的那一刻，数据必须还在 —— 就存在这里，由 `handleInbound`（对端直连）
+    /// 或 `pushClipboardPayload`（对端发 ClipboardAsk 让我们反向推）送出去。
+    public var pendingClipboardPayload: MWBClipboardPayload?
 
     private var listenFD: Int32 = -1
     private var acceptThread: Thread?
@@ -207,19 +251,60 @@ public final class MWBClipboardChannel {
         if session.peerIsPusher {
             // 对端发的是 ClipboardPush(79) → 它要推数据给我们（Windows → Mac）
             switch receiveData(fd: fd, dec: session.dec, postAction: session.peerPostAction) {
-            case .success(let url): onFileReceived?(url)
-            case .failure(let e):   log("[剪贴板] ✗ 接收失败: \(e.localizedDescription)")
+            case .success(let payload): onPayloadReceived?(payload)
+            case .failure(let e):       log("[剪贴板] ✗ 接收失败: \(e.localizedDescription)")
             }
         } else {
-            // 对端发的是 Clipboard(69) → 它在向我们要数据，我们推给它
-            guard let file = stagedFile else {
-                log("[剪贴板] ⚠️ 对端来拉取，但没有暂存文件 —— 可能拖放信令与文件未同步")
+            // 对端发的是 Clipboard(69) → 它在向我们要数据，我们推给它。
+            // 优先级：暂存文件（拖放）> 待发送的大剪贴板载荷（图片/文本 > 1MB）。
+            if let file = stagedFile {
+                switch sendDraggedFile(fd: fd, enc: session.enc, file: file) {
+                case .success(let n): log("[剪贴板] ✓ 已推送 \(file.lastPathComponent)（\(fmtBytes(n))）→ 对端将存到 桌面\\MouseWithoutBorders\\")
+                case .failure(let e): log("[剪贴板] ✗ 推送失败: \(e.localizedDescription)")
+                }
+            } else if let payload = pendingClipboardPayload {
+                switch sendClipboardPayload(fd: fd, enc: session.enc, payload: payload) {
+                case .success(let n):
+                    log("[剪贴板] ✓ 对端拉取：已推送剪贴板载荷（\(payloadWiredName(payload))，\(fmtBytes(n))）")
+                    pendingClipboardPayload = nil
+                case .failure(let e):
+                    log("[剪贴板] ✗ 剪贴板载荷推送失败: \(e.localizedDescription)")
+                }
+            } else {
+                log("[剪贴板] ⚠️ 对端来拉取，但既没有暂存文件也没有待推送的剪贴板载荷 —— 可能信令与数据未同步")
                 return
             }
-            switch sendDraggedFile(fd: fd, enc: session.enc, file: file) {
-            case .success(let n): log("[剪贴板] ✓ 已推送 \(file.lastPathComponent)（\(fmtBytes(n))）→ 对端将存到 桌面\\MouseWithoutBorders\\")
-            case .failure(let e): log("[剪贴板] ✗ 推送失败: \(e.localizedDescription)")
-            }
+        }
+    }
+
+    /// 反向推送待发送的大剪贴板载荷（对端发 ClipboardAsk(78) 时用；对称于 `pushStagedFile`）。
+    public func pushClipboardPayload(to host: String) -> Result<Int64, MWBClipboardError> {
+        guard let payload = pendingClipboardPayload else {
+            return .failure(.rejected("没有待推送的剪贴板载荷"))
+        }
+        let fd = connectSocket(host: host, port: port)
+        guard fd >= 0 else {
+            return .failure(.connectFailed("\(host):\(port)（Windows MWB 是否在运行？防火墙是否放行 \(port)？）"))
+        }
+        defer { Darwin.close(fd) }
+        applySocketOptions(fd: fd)
+
+        let session: Session
+        switch shakeHand(fd: fd, weAreDataHolder: true, post: .other) {
+        case .success(let s): session = s
+        case .failure(let e): return .failure(e)
+        }
+        // 与 pushStagedFile 同理：对端回 Push 也可能表示「它接收」，这里不判角色、直接推。
+        let r = sendClipboardPayload(fd: fd, enc: session.enc, payload: payload)
+        if case .success = r { pendingClipboardPayload = nil }
+        return r
+    }
+
+    private func payloadWiredName(_ p: MWBClipboardPayload) -> String {
+        switch p {
+        case .image:    return "图片(PNG)"
+        case .textWire: return "文本"
+        case .file:     return "文件"
         }
     }
 
@@ -262,11 +347,13 @@ public final class MWBClipboardChannel {
         if listenFD >= 0 { Darwin.close(listenFD); listenFD = -1 }
     }
 
-    /// 主动去对端拉一个文件（Windows → Mac 方向）。
+    /// 主动去对端拉数据（Windows → Mac 方向）：文件、剪贴板图片、剪贴板文本都可能。
     ///
     /// 对称于 PowerToys `Clipboard.ConnectAndGetData`：请求方发 `Clipboard(69)`，
     /// 数据持有方回 `ClipboardPush(79)`，于是本端负责接收。
-    public func fetchFile(from host: String, postAction: MWBPostAction = .other) -> Result<URL, MWBClipboardError> {
+    /// 拿到的是文件还是剪贴板内容，**由对端头里的类型名决定**（见 `MWBClipboardPayload`）。
+    public func fetchPayload(from host: String, postAction: MWBPostAction = .other)
+        -> Result<MWBClipboardPayload, MWBClipboardError> {
         let fd = connectSocket(host: host, port: port)
         guard fd >= 0 else {
             return .failure(.connectFailed("\(host):\(port)（Windows MWB 是否在运行？防火墙是否放行 \(port)？）"))
@@ -284,6 +371,16 @@ public final class MWBClipboardChannel {
             return .failure(.rejected("对端未接管推送角色（双方角色冲突）"))
         }
         return receiveData(fd: fd, dec: session.dec, postAction: postAction.rawValue)
+    }
+
+    /// 只要文件的旧接口（拖放路径专用）。对端推来的是剪贴板内容时判为失败。
+    public func fetchFile(from host: String, postAction: MWBPostAction = .other) -> Result<URL, MWBClipboardError> {
+        switch fetchPayload(from: host, postAction: postAction) {
+        case .failure(let e): return .failure(e)
+        case .success(.file(let u)): return .success(u)
+        case .success(let other):
+            return .failure(.rejected("对端推来的不是文件（\(payloadWiredName(other))）"))
+        }
     }
 
     // MARK: - 握手
@@ -490,7 +587,13 @@ public final class MWBClipboardChannel {
 
     // MARK: - 接收数据（Windows → Mac）
 
-    private func receiveData(fd: Int32, dec: CBCContext, postAction: UInt32) -> Result<URL, MWBClipboardError> {
+    /// 接收一帧数据。类型由 1024 字节头里的名字决定（对齐 PowerToys
+    /// `ReceiveAndProcessClipboardDataCore` 的 `StartsWith("image"/"text")` 判定）：
+    ///   `image`  → 剪贴板图片，收进内存（PNG 原始字节）
+    ///   `text`   → 剪贴板文本，收进内存（DEFLATE 压缩的打包串）
+    ///   其它     → 文件，落盘到 `桌面/MouseWithoutBorders/`
+    private func receiveData(fd: Int32, dec: CBCContext, postAction: UInt32)
+        -> Result<MWBClipboardPayload, MWBClipboardError> {
         // ① 1024 字节头
         let headRaw: [UInt8]
         switch readAll(fd, 1024) {
@@ -517,7 +620,7 @@ public final class MWBClipboardChannel {
         // ★★ 必须把 Windows 的反斜杠归一化，否则整条路径会变成文件名 ★★
         //
         // 对端发来的头里是 **Windows 路径**，实测长这样：
-        //   C:\Users\<用户名>\Desktop\MouseWithoutBorders\<文件名>.png
+        //   C:\Users\bunkr\Desktop\MouseWithoutBorders\PixPin_2026-08-30_21-39-51.png
         // 而 `NSString.lastPathComponent` **只认 "/"** —— 遇到反斜杠路径它会原样返回，
         // 于是我们把「整条路径」当成了文件名。更坑的是 macOS 里 ":" 是合法字符
         // 但 Finder 会把它**显示成 "/"**，所以用户看到的名字就是一条完整路径
@@ -529,30 +632,48 @@ public final class MWBClipboardChannel {
         guard !baseName.isEmpty, baseName != ".", baseName != ".." else {
             return .failure(.ioFailed("对端给出的文件名不可用: \(remotePath.suffix(80))"))
         }
-        log("[剪贴板] 对端来文件：\(baseName)（\(fmtBytes(size))）"
-            + (baseName == remotePath ? "" : "  原始路径=\(remotePath)"))
 
-        // ② 落点：桌面\MouseWithoutBorders\（与 Windows 端 postAction=desktop 的习惯对齐）
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let dir = home.appendingPathComponent("Desktop/MouseWithoutBorders", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        var dest = dir.appendingPathComponent(baseName)
-        // 重名自动加序号，避免覆盖
-        var n = 1
-        while FileManager.default.fileExists(atPath: dest.path) {
-            let stem = (baseName as NSString).deletingPathExtension
-            let ext = (baseName as NSString).pathExtension
-            let name = ext.isEmpty ? "\(stem) (\(n))" : "\(stem) (\(n)).\(ext)"
-            dest = dir.appendingPathComponent(name)
-            n += 1
+        // ② 是不是剪贴板内容？（内存型载荷，不落盘）
+        let lower = baseName.lowercased()
+        let isImageWire = lower.hasPrefix("image")
+        let isTextWire  = lower.hasPrefix("text")
+        let toMemory = isImageWire || isTextWire
+
+        let out: FileHandle?
+        let dest: URL?
+        if toMemory {
+            log("[剪贴板] 对端来剪贴板\(isImageWire ? "图片" : "文本")：\(fmtBytes(size))")
+            dest = nil
+            out = nil
+        } else {
+            log("[剪贴板] 对端来文件：\(baseName)（\(fmtBytes(size))）"
+                + (baseName == remotePath ? "" : "  原始路径=\(remotePath)"))
+            // 落点：桌面\MouseWithoutBorders\（与 Windows 端 postAction=desktop 的习惯对齐）
+            let home = FileManager.default.homeDirectoryForCurrentUser
+            let dir = home.appendingPathComponent("Desktop/MouseWithoutBorders", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            var d = dir.appendingPathComponent(baseName)
+            // 重名自动加序号，避免覆盖
+            var n = 1
+            while FileManager.default.fileExists(atPath: d.path) {
+                let stem = (baseName as NSString).deletingPathExtension
+                let ext = (baseName as NSString).pathExtension
+                let name = ext.isEmpty ? "\(stem) (\(n))" : "\(stem) (\(n)).\(ext)"
+                d = dir.appendingPathComponent(name)
+                n += 1
+            }
+            FileManager.default.createFile(atPath: d.path, contents: nil)
+            guard let fh = FileHandle(forWritingAtPath: d.path) else {
+                return .failure(.ioFailed("无法写入 \(d.path)"))
+            }
+            dest = d
+            out = fh
         }
-        FileManager.default.createFile(atPath: dest.path, contents: nil)
-        guard let out = FileHandle(forWritingAtPath: dest.path) else {
-            return .failure(.ioFailed("无法写入 \(dest.path)"))
-        }
-        defer { try? out.close() }
+        defer { try? out?.close() }
 
         // ③ 读 size 字节（按 16 对齐收，多收的丢掉）
+        var buf: [UInt8] = []
+        if toMemory { buf.reserveCapacity(Int(max(0, size))) }
         var remaining = size
         while remaining > 0 {
             let want = Int(min(Int64(64 * 1024), remaining))
@@ -566,11 +687,87 @@ public final class MWBClipboardChannel {
                 return .failure(.ioFailed("数据解密失败"))
             }
             let take = Int(min(Int64(pt.count), remaining))
-            out.write(Data(pt[0..<take]))
+            if toMemory {
+                buf.append(contentsOf: pt[0..<take])
+            } else {
+                out?.write(Data(pt[0..<take]))
+            }
             remaining -= Int64(take)
         }
+
+        if isImageWire {
+            log("[剪贴板] ✓ 已收到图片（\(fmtBytes(Int64(buf.count)))，"
+                + "PNG 魔数=\(ClipboardSync.looksLikePNG(Data(buf)) ? "✓" : "✗")）")
+            return .success(.image(Data(buf)))
+        }
+        if isTextWire {
+            log("[剪贴板] ✓ 已收到文本（压缩后 \(fmtBytes(Int64(buf.count)))）")
+            return .success(.textWire(buf))
+        }
+        guard let dest else { return .failure(.ioFailed("落盘路径缺失")) }
         log("[剪贴板] ✓ 已保存到 \(dest.path)")
-        return .success(dest)
+        return .success(.file(dest))
+    }
+
+    // MARK: - 发送剪贴板载荷（供对端来拉时用）
+
+    /// 把一个内存型剪贴板载荷按 `SendClipboardData` 的格式发出去：
+    /// 1024 字节定长头 `"{字节数}*image"` / `"{字节数}*text"` + 原始字节。
+    ///
+    /// ★ 头里的类型名**必须**是 `image` / `text`（小写即可，对端不区分大小写），
+    ///   否则 Windows 会把它当文件存到磁盘上，而不是放进剪贴板。
+    /// ★ 文件型载荷交给 `sendDraggedFile`（那条路会带上真实路径）。
+    @discardableResult
+    private func sendClipboardPayload(fd: Int32, enc: CBCContext, payload: MWBClipboardPayload)
+        -> Result<Int64, MWBClipboardError> {
+        let bytes: [UInt8]
+        let name: String
+        switch payload {
+        case .file(let url):
+            return sendDraggedFile(fd: fd, enc: enc, file: url)
+        case .image(let d):
+            bytes = [UInt8](d)
+            name = "image"
+        case .textWire(let b):
+            bytes = b
+            name = "text"
+        }
+        guard !bytes.isEmpty else { return .failure(.ioFailed("剪贴板载荷为空")) }
+
+        var hbuf = [UInt8](repeating: 0, count: 1024)
+        let header = "\(bytes.count)*\(name)"
+        var i = 0
+        for u in header.utf16 {
+            if i + 1 >= 1024 { break }
+            hbuf[i]     = UInt8(u & 0xFF)
+            hbuf[i + 1] = UInt8((u >> 8) & 0xFF)
+            i += 2
+        }
+        switch enc.encrypt(hbuf) {
+        case .failure(let e): return .failure(.ioFailed("头加密失败 \(e)"))
+        case .success(let ct):
+            if let err = writeAll(fd, ct) { return .failure(err) }
+        }
+
+        // 数据体：CBC 要求每次喂进去的都是 16 的整数倍，末片补 0；
+        // 对端只按头里声明的字节数收，多余的丢弃。
+        var offset = 0
+        let chunk = 64 * 1024
+        while offset < bytes.count {
+            let n = min(chunk, bytes.count - offset)
+            var blk = Array(bytes[offset..<(offset + n)])
+            if blk.count % MWBCrypto.blockSize != 0 {
+                let pad = MWBCrypto.blockSize - (blk.count % MWBCrypto.blockSize)
+                blk.append(contentsOf: [UInt8](repeating: 0, count: pad))
+            }
+            switch enc.encrypt(blk) {
+            case .failure(let e): return .failure(.ioFailed("数据加密失败 \(e)"))
+            case .success(let ct):
+                if let err = writeAll(fd, ct) { return .failure(err) }
+            }
+            offset += n
+        }
+        return .success(Int64(bytes.count))
     }
 
     // MARK: - socket 工具

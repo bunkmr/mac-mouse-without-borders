@@ -539,7 +539,15 @@ public final class MWBConnection {
         guard !isClosed, let out = output else { return .failure(.writeFailed) }
         var total = 0
         while total < data.count {
-            let n = out.write(Array(data[total...]), maxLength: data.count - total)
+            // ★ 直接用缓冲区指针写，不要 `Array(data[total...])`：
+            //   那样每次发送都要**再分配并拷贝一份**整包数据。鼠标移动包 200Hz、
+            //   键盘/心跳也在同一条路上，这个拷贝纯属白烧 CPU 和内存带宽。
+            let n = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return out.write(base.advanced(by: total)
+                                     .assumingMemoryBound(to: UInt8.self),
+                                 maxLength: data.count - total)
+            }
             // n <= 0 只可能是：对端已关闭 / RST / 写超时(SO_SNDTIMEO)。
             // 注意可能是**半包**（total > 0）—— 那意味着这条连接的字节流已经错位，
             // 必须让上层看门狗走重连，绝不能在错位的流上继续写。

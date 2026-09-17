@@ -27,6 +27,29 @@ APPNAME="MWB"                       # 改短名，跟历史条目 MWBMacClient �
 APP="$BUILD/$APPNAME.app"
 SIGN_ID="MWB Local Signer"          # 自签名证书（见 ensure_signer）
 
+# ★★★ 构建配置：默认必须是 release ★★★
+# 2026-09-16 事故复盘：本脚本原先直接吃 SwiftPM 的**默认配置 = debug(-Onone)**，
+# 而发布用的 DMG 是 release。于是**同一份源码**出现两种手感：
+#   · 从 DMG 装的 → 流畅
+#   · build_app.sh 装的 → 鼠标跨屏移动时约每 0.4s 顿一下（用户报的"轻微卡顿"）
+# 同一份 arm64 代码实测差异（可复现的客观判据）：
+#   debug   : __TEXT 1,048,576 / 符号 7206 / 2,435,120 字节
+#   release : __TEXT   557,056 / 符号 4955 / 1,515,680 字节
+# 原因：捕获线程热点每帧要做 AES-256-CBC 加密 + 事件序列化 + 每帧
+# CGAssociateMouseAndMouseCursorPosition(IPC)，实测事件率 500+Hz。
+# -Onone 下这些全部不内联、Swift retain/release 也不消除，单帧耗时成倍，
+# 累积抖动就变成肉眼可见的卡顿。
+# 要临时回 debug 做对照（例如排查"是不是优化把逻辑改坏了"）：
+#   CONFIG=debug ./build_app.sh
+CONFIG="${CONFIG:-release}"
+
+# SKIP_INSTALL=1：只编译/组装/签名到 /tmp/mwb-app，**不碰 /Applications**。
+# 用途：/Applications 的写入必须在「前台 + 脱沙箱」下进行（沙箱对后台任务无效），
+# 而 release 全量编译动辄几分钟，前台跑会超时转后台。于是分两步走：
+#   ① SKIP_INSTALL=1 ./build_app.sh      # 后台安全，产物在 /tmp
+#   ② ./build_app.sh                     # 增量编译几秒完成，前台脱沙箱做安装
+SKIP_INSTALL="${SKIP_INSTALL:-}"
+
 # ---- 确保签名证书存在（只需创建一次，之后永久复用）----
 ensure_signer() {
     if security find-identity -v -p codesigning 2>/dev/null | grep -q "$SIGN_ID"; then
@@ -76,18 +99,21 @@ echo "▶ 编译…"
 #   rename 会冲突报 "File exists"，关掉索引避免误报错误。
 #
 # 【必须两个 product 都编】之前只编 MWBMacClientApp，而 bin/mwbmac 是从
-# /tmp/mwbbuild/debug/mwbmac 拷过来的 —— 那个文件停留在**上一次全量构建**，
+# /tmp/mwbbuild/$CONFIG/mwbmac 拷过来的 —— 那个文件停留在**上一次全量构建**，
 # 于是 CLI 静默地跑着旧代码：拿它做回归自测会得到与源码不符的结论
 # （实测踩过：日志里出现源码中早已删掉的旧文案，白排查一轮）。
-swift build --build-path /tmp/mwbbuild --product MWBMacClientApp \
+# 【-c "$CONFIG" 不可省】省了就退回 SwiftPM 默认的 debug（-Onone），
+# 手感立刻退化（见文件头 CONFIG 处的「0.4s 卡顿」事故复盘）。
+echo "  配置 = $CONFIG"
+swift build --build-path /tmp/mwbbuild --configuration "$CONFIG" --product MWBMacClientApp \
     --disable-sandbox -Xswiftc -index-ignore-system-modules
-swift build --build-path /tmp/mwbbuild --product mwbmac \
+swift build --build-path /tmp/mwbbuild --configuration "$CONFIG" --product mwbmac \
     --disable-sandbox -Xswiftc -index-ignore-system-modules
 
 echo "▶ 在本地卷组装 bundle…"
 rm -rf "$BUILD"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp /tmp/mwbbuild/debug/MWBMacClientApp "$APP/Contents/MacOS/MWBMacClientApp"
+cp "/tmp/mwbbuild/$CONFIG/MWBMacClientApp" "$APP/Contents/MacOS/MWBMacClientApp"
 cp App/Info.plist "$APP/Contents/Info.plist"
 
 echo "▶ 应用图标…"
@@ -111,6 +137,14 @@ echo "▶ 签名（$SIGN_ID）…"
 codesign --force --deep --sign "$SIGN_ID" "$APP"
 codesign -dv "$APP" 2>&1 | grep -E "Identifier|Authority|Signature" || true
 
+# ---- 安装到 /Applications ----
+# SKIP_INSTALL=1 时整段跳过（分两步构建用，见文件头 CONFIG/SKIP_INSTALL 说明）。
+# ⚠️ 下面这一段必须「前台 + 脱沙箱」执行：沙箱会拦 /Applications 的写入，
+#    而脚本已经先把旧包 mv 走了 —— 半途失败会让 /Applications/MWB.app 变成
+#    没有可执行文件的半成品（App 直接不可用，且旧包已被移走）。
+if [ -n "$SKIP_INSTALL" ]; then
+    echo "▶ SKIP_INSTALL=1 → 跳过安装；已签名的产物在：$APP"
+else
 echo "▶ 安装到 /Applications…"
 # 【为什么要整包替换，不用就地 cp 覆盖】
 # 就地 cp 覆盖会保留**上一版**的 Contents/_CodeSignature/CodeResources，
@@ -143,9 +177,10 @@ codesign --verify --deep "/Applications/$APPNAME.app" && echo "  ✅ 签名校�
 
 # 清掉历史同名残留，避免 TCC 列表里出现「勾了 A 却跑 B」
 rm -rf /Applications/MWBMacClient.app 2>/dev/null || true
+fi
 
 echo "▶ 同时更新命令行版（对照用）…"
-mkdir -p bin && cp /tmp/mwbbuild/debug/mwbmac bin/mwbmac
+mkdir -p bin && cp "/tmp/mwbbuild/$CONFIG/mwbmac" bin/mwbmac
 echo "  bin/mwbmac → $(stat -f '%Sm  (%z bytes)' bin/mwbmac)"
 
 echo

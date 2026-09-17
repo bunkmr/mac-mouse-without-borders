@@ -6,6 +6,330 @@ import Foundation
 import CoreGraphics
 import AppKit
 
+// MARK: - 延迟探针（环境变量 MWB_LATPROBE=1 启用）
+//
+// 【它解决什么问题】"跨屏到 Windows 后每 ~0.4s 顿一下"这类主观手感问题，
+// 靠读代码无法定位 —— 因为"顿"可能发生在四个完全不同的环节，而它们
+// 在源码里看起来都很正常。这个探针把一次跨屏移动拆成**互不重叠**的几段，
+// 分别记录窗口内的最大尖峰，一次实测就能点名到底卡在哪一段：
+//
+// | 环节 | 含义 | 偏大说明什么 |
+// |---|---|---|
+// | 积压 backlog | HID 事件产生 → 进入我们的 tap 回调 | 系统/线程调度，**与本程序代码无关** |
+// | 处理 handle  | 我们回调的总耗时 | 本地代码变慢（AES / 打包等） |
+// | 其中发包 send | 上述耗时里 `onCaptured`（socket 写）那一段 | TCP 发送缓冲满 / 对端不读 |
+// | 事件间隔 gap | 相邻两个 tap 事件的实际间距 | 事件断流（tap 被禁用 / 线程被挂起） |
+// | 补发滞后 flush | 被 5ms 限流挡下的"最后一帧位置"，等了多久才补发出去 | 主队列拥塞 / 定时器被合并 |
+// | 定时器间隔 tick | 5ms 补发定时器的实际触发间隔 | 同上，且能量化调度延迟 |
+//
+// 判据：**哪个环节冒出 40ms+ 的尖峰，卡顿就在那一环**；若全部只有个位数 ms，
+// 则本机（Mac 侧）整条链路是干净的，问题必然在链路或对端。
+//
+// 该探针默认关闭：只读一次环境变量，其余分支全部短路，不产生日志与可测开销。
+
+/// mach 时间基，进程内读一次即可。
+private let mwbTimebase: mach_timebase_info_data_t = {
+    var tb = mach_timebase_info_data_t()
+    mach_timebase_info(&tb)
+    return tb
+}()
+
+/// mach tick → 秒。
+private func mwbSecs(_ t: UInt64) -> Double {
+    Double(t) * Double(mwbTimebase.numer) / Double(mwbTimebase.denom) / 1e9
+}
+
+/// 探针日志用的事件名（只在超阈值时才调用，正常路径零开销）。
+private func mwbEventName(_ raw: UInt32) -> String {
+    switch raw {
+    case 5:  return "鼠标移动"
+    case 6:  return "左键拖拽"
+    case 7:  return "右键拖拽"
+    case 27: return "其它拖拽"
+    case 1:  return "左键按下"
+    case 2:  return "左键抬起"
+    case 3:  return "右键按下"
+    case 4:  return "右键抬起"
+    case 22: return "滚轮"
+    case 10: return "键按下"
+    case 11: return "键抬起"
+    case 12: return "修饰键"
+    case 14: return "tap超时禁用"
+    case 15: return "tap被用户禁用"
+    default: return "类型\(raw)"
+    }
+}
+
+/// 探针状态的互斥锁。
+///
+/// 【为什么必须有】探针被**两个线程**写入：capture 线程（noteTap / noteSend /
+/// noteSendGap）与主线程（5ms 补发定时器的 noteTick、锁定时钟里的 reportIfDue）。
+/// `LatencyProbe` 是**结构体**，无保护的并发写会**丢更新** —— 某一拍 `lastSendMach`
+/// 的写入被另一线程的整块回写覆盖掉，下一拍就凭空算出一个偏大的间隔，
+/// **伪造出"突发内空洞"**，把我引到错误结论上。
+///
+/// 本项目今天已经因为一个**单位错误**（CGEvent.timestamp 实为 mach tick）白排查一轮，
+/// 不能再让测量工具本身说谎：所有变更都在锁内完成，丢更新不可能发生。
+/// 开销 ~100ns/次，而探针写入频率约 400 次/秒 → 完全可忽略。
+fileprivate let mwbProbeLock = NSLock()
+
+fileprivate struct LatencyProbe {
+    let enabled: Bool
+
+    // 窗口内极值与超阈值计数
+    private var lens = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   // 积压/处理/发包/间隔/补发/定时器
+    private var over = [0, 0, 0, 0, 0]                  // 前五项 >20ms 的次数
+    private var tapEvents = 0
+    private var sinkEvents = 0                          // 被限流挡下的次数
+    private var bigGapDesc = ""                         // 最近一次超过 20ms 的间隔描述
+    private var bigBacklogDesc = ""
+
+    // 跨窗口状态
+    private var lastTapMach: UInt64 = 0
+    private var lastTickMach: UInt64 = 0
+    private var pendingSinceMach: UInt64 = 0
+    private var lastReportMach: UInt64 = 0
+
+    // ⑥ 出包内容：位置有没有真的在动
+    private var packets = 0
+    private var frozenPackets = 0
+    private var maxJump = 0
+    private var hasPos = false
+    private var lastPos: (Int32, Int32) = (0, 0)
+
+    // ⑦ 出包间隔：两次**真正写入 socket** 之间的间隔。
+    //
+    // 「跨屏后每 0.4s 顿一下」最直接的客观证据就在这里：
+    // 若本机出包节奏是均匀的（全部 <10ms），卡顿就不可能出在本机这一环
+    // （限流 / 加密 / 阻塞写），只可能在下游（链路或对端注入）。
+    // 反之若出现了"周期性 60~100ms 空洞"，那就是本机自己造成的。
+    //
+    // ★ 必须用**突发内空洞**这个判据，不能用"最大间隔"：
+    //   用户停手时本来就没有包，最大间隔永远是用户停手时长，毫无信息量。
+    //   定义：前后两个间隔都 <20ms，中间那个却 >20ms ⇒ 手在动、却有一段时间没出包。
+    private var lastSendMach: UInt64 = 0
+    private var prevSendGapMs: Double = -1
+    private var burstHoles: [Double] = []
+    private var sendGapBins = [0, 0, 0, 0, 0]   // <10 / 10-20 / 20-50 / 50-100 / >100 ms
+
+    // ⑧ 空洞的**窗口内相对时刻**（ms）—— 判断"周期性"的关键。
+    //
+    // 只报"3s 内有 6 次空洞"是不够的：那既可能是**周期性卡顿**（真正的 bug），
+    // 也可能只是**用户手停了一下再动**（一回合一长间隔，完全正常）。
+    // 两者用一条信息就能区分：
+    //   把每次空洞的时刻都记下来 → 算相邻空洞的间隔
+    //     · 间隔稳定（如恒定 430ms）⇒ 周期性事件 ⇒ 机器/链路侧的定时任务
+    //     · 间隔杂乱无章 ⇒ 用户手停 ⇒ 与我们无关
+    // 这就是今天要拿的**硬证据**，胜过任何代码推断。
+    private var holeOffsets: [Int] = []        // 出包中断 >25ms 的时刻
+    private var eventHoleOffsets: [Int] = []   // tap 事件中断 >25ms 的时刻
+    private var windowStartMach: UInt64 = 0
+
+    /// 窗口内相对时刻（ms）。
+    private func offsetMs(_ t: UInt64) -> Int {
+        guard windowStartMach != 0, t > windowStartMach else { return 0 }
+        return Int(mwbSecs(t - windowStartMach) * 1000)
+    }
+
+    /// ⑥ 记录每个已发出的鼠标位置包。
+    ///
+    /// 这一项回答一个很尖锐的问题：**用户明明在移动鼠标，我们发出去的坐标在动吗？**
+    /// 若「位置未变」占比很高，说明位移提取/清零逻辑把 delta 吃掉了 ——
+    /// 那样 Windows 侧光标就是"一顿一顿"地跳，而本机发包率、CPU、日志全都正常。
+    mutating func notePacket(x: Int32, y: Int32) {
+        guard enabled else { return }
+        mwbProbeLock.lock(); defer { mwbProbeLock.unlock() }
+        packets += 1
+        if hasPos && lastPos.0 == x && lastPos.1 == y {
+            frozenPackets += 1
+        } else if hasPos {
+            let jump = max(abs(Int(x) - Int(lastPos.0)), abs(Int(y) - Int(lastPos.1)))
+            if jump > maxJump { maxJump = jump }
+        }
+        lastPos = (x, y)
+        hasPos = true
+    }
+
+    init() {
+        // 两种开启方式（任一命中即开）：
+        //   ① 环境变量 `MWB_LATPROBE=1`（命令行版/自检用）
+        //   ② 标记文件 `/tmp/mwb_latprobe` 存在
+        // 【为什么需要文件开关】GUI App 由 `open` 启动时**拿不到调用方的环境变量**
+        // （macOS 实测 `open --env K=V` 传不进去，钩子会静默不触发），
+        // 文件开关免去 launchctl setenv 那套麻烦，删掉文件即恢复零开销。
+        let byEnv = ProcessInfo.processInfo.environment["MWB_LATPROBE"] == "1"
+        let byFile = FileManager.default.fileExists(atPath: "/tmp/mwb_latprobe")
+        enabled = byEnv || byFile
+    }
+
+    /// tap 回调：入口/出口各采一次。`kind` 传事件类型 rawValue（只在超阈值时才格式化成名字）。
+    mutating func noteTap(eventTimestampNs: UInt64, entry: UInt64, exit: UInt64, kind: UInt32) {
+        guard enabled else { return }
+        mwbProbeLock.lock(); defer { mwbProbeLock.unlock() }
+        tapEvents += 1
+        // ① 积压：事件产生 → 进入回调。
+        //
+        // ★★ 单位坑（2026-09-16 实测，白排查一轮）：
+        // `CGEvent.timestamp` 的文档说"纳秒"，但在这台机器上它**就是 mach_absolute_time
+        // 的 tick**（timebase 125/3）。按纳秒除会算出：
+        //     积压 = mwbSecs(entry) − tick/1e9 ≈ 开机秒数 − 3 小时 ≈ 4.5 亿 ms
+        // ——一个和 tick 无关、只随墙上时钟 1:1 增长的荒谬值，把整个指标作废。
+        // 判定方法（`/tmp/tsunit.swift`）：同刻的 mach_absolute_time() 与 event.timestamp
+        // 同量级（≈1.1e13），而"开机纳秒"是 ≈5.5e14 —— 差 50 倍，一眼可辨。
+        // 结论：一律走 mwbSecs() 做 tick→秒，绝不再手写 /1e9。
+        let backlog = eventTimestampNs <= entry ? mwbSecs(entry - eventTimestampNs) : 0
+        if backlog > lens[0] {
+            lens[0] = backlog
+            if backlog > 0.02 { bigBacklogDesc = "\(mwbEventName(kind)) \(Int(backlog * 1000))ms" }
+        }
+        if backlog > 0.02 { over[0] += 1 }
+        // ② 处理总耗时
+        let handle = mwbSecs(exit - entry)
+        if handle > lens[1] { lens[1] = handle }
+        if handle > 0.02 { over[1] += 1 }
+        // ④ 与上一个事件的间隔（事件断流会在这里现形）
+        if lastTapMach != 0 {
+            let gap = mwbSecs(entry - lastTapMach)
+            if gap > lens[3] {
+                lens[3] = gap
+                if gap > 0.02 { bigGapDesc = "\(mwbEventName(kind)) \(Int(gap * 1000))ms" }
+            }
+            if gap > 0.02 { over[3] += 1 }
+            // ⑧ 记下这次事件中断的时刻（与出包空洞的时刻对比，就能分清
+            //    "事件源本来就没给事件"还是"事件给了、我们没发出去"）
+            if gap > 0.025, eventHoleOffsets.count < 40 { eventHoleOffsets.append(offsetMs(entry)) }
+        }
+        lastTapMach = entry
+    }
+
+    /// ③ `onCaptured`（socket 写）那一段的耗时。
+    mutating func noteSend(_ t: UInt64) {
+        guard enabled else { return }
+        mwbProbeLock.lock(); defer { mwbProbeLock.unlock() }
+        let d = mwbSecs(t)
+        if d > lens[2] { lens[2] = d }
+        if d > 0.02 { over[2] += 1 }
+    }
+
+    /// 位置被限流挡下："最后一帧"的时刻。
+    mutating func notePending() {
+        guard enabled else { return }
+        mwbProbeLock.lock(); defer { mwbProbeLock.unlock() }
+        sinkEvents += 1
+        pendingSinceMach = mach_absolute_time()
+    }
+
+    /// ⑦ 每次**真正发出**一个鼠标位置包之后调用（紧跟 onCaptured）。
+    ///
+    /// 判定"突发内空洞"需要**看下一个间隔**才知道自己是不是被夹在中间，
+    /// 所以这里用一拍延迟：本拍先把候选记为 prevSendGapMs，下一拍若发现自己
+    /// 很短(<20ms) 而候选很长(>20ms) —— 候选就被确认是突发内部的空洞。
+    mutating func noteSendGap() {
+        guard enabled else { return }
+        mwbProbeLock.lock(); defer { mwbProbeLock.unlock() }
+        let now = mach_absolute_time()
+        defer { lastSendMach = now }
+        guard lastSendMach != 0 else { return }
+        let gapMs = mwbSecs(now - lastSendMach) * 1000
+        if gapMs < 10 { sendGapBins[0] += 1 }
+        else if gapMs < 20 { sendGapBins[1] += 1 }
+        else if gapMs < 50 { sendGapBins[2] += 1 }
+        else if gapMs < 100 { sendGapBins[3] += 1 }
+        else { sendGapBins[4] += 1 }
+
+        if prevSendGapMs > 20 && gapMs < 20, burstHoles.count < 500 {
+            burstHoles.append(prevSendGapMs)
+        }
+        // ⑧ 出包中断 >25ms 的时刻（周期性判据，见 holeOffsets 注释）
+        if gapMs > 25, holeOffsets.count < 40 { holeOffsets.append(offsetMs(now)) }
+        prevSendGapMs = gapMs
+    }
+
+    /// 补发真的发出去了 —— 这一帧从被挡下到实际发出，共滞后多久。
+    mutating func noteFlushSent() {
+        guard enabled, pendingSinceMach != 0 else { return }
+        mwbProbeLock.lock(); defer { mwbProbeLock.unlock() }
+        let d = mwbSecs(mach_absolute_time() - pendingSinceMach)
+        if d > lens[4] { lens[4] = d }
+        if d > 0.02 { over[4] += 1 }
+        pendingSinceMach = 0
+    }
+
+    /// ⑥ 5ms 补发定时器的一次 tick。
+    mutating func noteTick() {
+        guard enabled else { return }
+        mwbProbeLock.lock(); defer { mwbProbeLock.unlock() }
+        let now = mach_absolute_time()
+        if lastTickMach != 0 {
+            let d = mwbSecs(now - lastTickMach)
+            if d > lens[5] { lens[5] = d }
+        }
+        lastTickMach = now
+    }
+
+    /// 每 3s 输出一次并重置窗口。返回值 nil 表示未到输出时机。
+    mutating func reportIfDue() -> String? {
+        guard enabled else { return nil }
+        mwbProbeLock.lock(); defer { mwbProbeLock.unlock() }
+        let now = mach_absolute_time()
+        if lastReportMach == 0 { lastReportMach = now; return nil }
+        let span = mwbSecs(now - lastReportMach)
+        guard span >= 3 else { return nil }
+        defer {
+            lastReportMach = now
+            lens = [0, 0, 0, 0, 0, 0]
+            over = [0, 0, 0, 0, 0]
+            tapEvents = 0
+            sinkEvents = 0
+            bigGapDesc = ""
+            bigBacklogDesc = ""
+            packets = 0
+            frozenPackets = 0
+            maxJump = 0
+            burstHoles = []
+            sendGapBins = [0, 0, 0, 0, 0]
+            prevSendGapMs = -1
+            holeOffsets = []
+            eventHoleOffsets = []
+            windowStartMach = now      // 新窗口的时刻零点
+        }
+        guard tapEvents > 0 || packets > 0 else { return nil }
+        var s = "【延迟探针】\(Int(span))s内 事件=\(tapEvents) 被限流=\(sinkEvents) 出包=\(packets)"
+            + " │ 积压max=\(Int(lens[0] * 1000))ms(>20ms:\(over[0]))"
+            + " 处理max=\(Int(lens[1] * 1000))ms(>20ms:\(over[1]))"
+            + " 其中发包max=\(Int(lens[2] * 1000))ms(>20ms:\(over[2]))"
+            + " 事件间隔max=\(Int(lens[3] * 1000))ms(>20ms:\(over[3]))"
+            + " 补发滞后max=\(Int(lens[4] * 1000))ms(>20ms:\(over[4]))"
+            + " 补发定时器间隔max=\(Int(lens[5] * 1000))ms"
+            + " │ 位置未变=\(frozenPackets)包 最大跳变=\(maxJump)/65535"
+            + " │ 出包间隔<10ms:\(sendGapBins[0]) 10-20:\(sendGapBins[1])"
+            + " 20-50:\(sendGapBins[2]) 50-100:\(sendGapBins[3]) >100:\(sendGapBins[4])"
+        // 突发内空洞：手在动却有一段时间没出包 —— 这就是"顿一下"的本机侧硬证据。
+        // 计数直接给出周期：本窗口 3s，若每次都是 7~8 次 ⇒ 周期 ≈ 3s/7.5 = 400ms。
+        if burstHoles.isEmpty {
+            s += " │ 突发内空洞=0次 ✓"
+        } else {
+            let top = burstHoles.sorted(by: >).prefix(5).map { Int($0) }
+            s += " │ 突发内空洞=\(burstHoles.count)次 最大=\(top.first ?? 0)ms 前5=\(top)"
+        }
+        // ⑧ 周期性判据：把空洞的时刻与相邻间隔都摊开。
+        //    间隔稳定 ⇒ 周期性事件（机器/链路侧定时任务）；间隔杂乱 ⇒ 用户手停。
+        if holeOffsets.count >= 2 {
+            let d = zip(holeOffsets.dropFirst(), holeOffsets).map { $0 - $1 }
+            s += " │ 出包空洞时刻ms=\(holeOffsets) 相邻间隔ms=\(d)"
+        } else if holeOffsets.count == 1 {
+            s += " │ 出包空洞时刻ms=\(holeOffsets)（仅 1 次，无周期性）"
+        }
+        if eventHoleOffsets.count >= 2 {
+            let d = zip(eventHoleOffsets.dropFirst(), eventHoleOffsets).map { $0 - $1 }
+            s += " │ 事件空洞时刻ms=\(eventHoleOffsets) 相邻间隔ms=\(d)"
+        }
+        if !bigGapDesc.isEmpty { s += " │ 最大断流: \(bigGapDesc)" }
+        if !bigBacklogDesc.isEmpty { s += " │ 最大积压: \(bigBacklogDesc)" }
+        return s
+    }
+}
+
 // Windows 鼠标消息 (dwFlags 取值)
 private let WM_MOUSEMOVE: Int32   = 0x0200
 private let WM_LBUTTONDOWN: Int32 = 0x0201
@@ -15,6 +339,16 @@ private let WM_RBUTTONUP: Int32   = 0x0205
 private let WM_MBUTTONDOWN: Int32 = 0x0207
 private let WM_MBUTTONUP: Int32   = 0x0208
 private let WM_MOUSEWHEEL: Int32  = 0x020A
+/// 水平滚轮。用于「按住某键 + 滚动 = 水平滚动」这类轴改写动作。
+/// 与 WM_MOUSEWHEEL 同构，只是方向轴换成 X。
+private let WM_MOUSEHWHEEL: Int32 = 0x020E
+/// 侧键（XButton）。PowerToys 把「哪个侧键」放在 MOUSEDATA.WheelDelta 里
+/// （InputHook.cs:253 原话 “Use WheelDelta to store XBUTTON1/XBUTTON2 data”），
+/// 所以侧键包 = flags: WM_XBUTTONDOWN/UP + mouseWheel: XBUTTON1(1)/XBUTTON2(2)。
+private let WM_XBUTTONDOWN: Int32  = 0x020B
+private let WM_XBUTTONUP: Int32    = 0x020C
+private let XBUTTON1: Int32        = 0x0001   // 后退
+private let XBUTTON2: Int32        = 0x0002   // 前进
 
 /// 触发切换的屏幕边缘。MWB 的行为是：光标顶到这条边并继续外推，
 /// 才把控制权交给相邻机器；在此之前本地光标正常，不向对端转发任何事件。
@@ -43,6 +377,101 @@ public final class InputController {
     public private(set) var isControllingRemote = false
     /// 触发切换的本机边缘（Windows 屏幕的相对位置）。
     public var switchEdge: SwitchEdge = .right
+
+    // MARK: - 快捷键映射（高级设置）
+
+    /// Command 键跨屏语义。默认 `.native`（与 MWB 原生一致，不改动老行为）。
+    ///
+    /// 【为什么要有这个】原生把 Cmd 当 Windows 键发；于是「鼠标侧键 = Cmd+C」跨屏到
+    /// Windows 上变成 Win+C（打开搜索），用户看到的就是"鼠标快捷键跨屏失效"。
+    /// 改成 `.asControl` 后 Cmd+C/V/A/S/Z 在 Windows 上就是对等的 Ctrl 组合。
+    public var commandKeyMode: CommandKeyMode = .native {
+        didSet {
+            guard oldValue != commandKeyMode else { return }
+            diag("[MWB] 快捷键映射：Command 键语义 = \(commandKeyMode.displayName)")
+            // 语义变了必须把已按住的修饰键状态清掉，否则会残留上一套语义的按键。
+            forwardedModifiers.removeAll()
+        }
+    }
+
+    // MARK: - 可编程鼠标键
+
+    /// 可编程鼠标键表：每个按键有「点按 / 按住滚动 / 按住拖动」×「本机 Mac / 远端 Windows」
+    /// 共 6 项独立设置。**空表 = 所有按键都按原样处理**（老行为，向后兼容）。
+    ///
+    /// 【为什么不再写死「后退 / 前进」】老版本只有两个下拉框，只能映射组合键；
+    /// 而真实鼠标有 3~15 个键，且同一个键在不同手势下期望完全不同。
+    /// 详见 `MouseBinding.swift` 头部说明。
+    public var mouseBindings = MouseBindingStore()
+
+    /// 滚轮方向反转：**发给远端**（本机滚轮 → Windows）。
+    /// 【为什么需要】Mac 的「自然滚动」把双指上滑定为"内容下移"，Windows 的滚轮
+    /// 正负方向与之正好相反，不反转的话跨屏滚动的体感是反的。
+    public var scrollReverseToRemote = false
+
+    /// 滚轮方向反转：**从远端接收**（Windows 滚轮 → 本机）。
+    public var scrollReverseFromRemote = false
+
+    /// 自动捕获模式：界面点「自动捕获」后置位，**下一次鼠标按下**只上报按键号，
+    /// 不产生任何点击效果（事件被吞掉）。
+    /// 用途：用户不必去猜"我这个键是几号"，按一下就让程序认出来。
+    public var isCapturingMouseButton = false
+
+    /// 捕获到按键号（macOS 0 基 `mouseEventButtonNumber`）时回调。
+    /// ⚠️ 回调**可能不在主线程**，界面侧需自行切回主线程。
+    public var onMouseButtonCaptured: ((Int) -> Void)?
+
+    /// 「侧键 3/4 互换」。
+    ///
+    /// 【为什么需要】macOS 的 `mouseEventButtonNumber` 是 **0 基**的（3 = 第 4 个键、
+    /// 4 = 第 5 个键），而鼠标包装、驱动面板、Windows 一律按 **1 基**叫「Button 4 /
+    /// Button 5」。绝大多数鼠标把「后退」报成 3（= Button 4），但也有一小部分
+    /// （Razer 系、个别罗技/无牌鼠）HID 描述符把两个侧键**反过来**报 ——
+    /// 那样系统眼里的 3 其实是「前进」。这个开关把 3 与 4 整体翻转，
+    /// **捕获 / 转发给 Windows / 接受 Windows 的侧键** 三处同时生效，
+    /// 用户不必去改鼠标驱动。
+    public var swapSideButtons = false
+
+    /// macOS 0 基按键号 → 用户视角的「物理按键号」（1 基）+ 功能名。
+    /// 3 → 「4（后退）」、4 → 「5（前进）」，其余只给号。
+    /// **日志里必须同时打这两个号**：只打一个，用户看到的永远比自己的鼠标少 1，
+    /// 必然怀疑「后退/前进接反了」。
+    public func physicalButtonLabel(_ macNumber: Int) -> String {
+        let n = macNumber + 1
+        switch macNumber {
+        case 3: return "\(n)【后退】"
+        case 4: return "\(n)【前进】"
+        default: return "\(n)"
+        }
+    }
+
+    /// 应用「侧键互换」后的**有效**按键号（捕获与注入两侧共用，保证对称）。
+    public func effectiveSideButton(_ macNumber: Int) -> Int {
+        guard swapSideButtons else { return macNumber }
+        if macNumber == 3 { return 4 }
+        if macNumber == 4 { return 3 }
+        return macNumber
+    }
+
+    /// macOS 按键号 → Windows XButton 号（1 = XBUTTON1 后退 / 2 = XBUTTON2 前进）。
+    /// PowerToys 把「哪个侧键」放在 `MOUSEDATA.WheelDelta` 里（它源码注释原话
+    /// "Use WheelDelta to store XBUTTON1/XBUTTON2 data"），所以侧键包 =
+    /// flags: WM_XBUTTONDOWN/UP + mouseWheel: 1 或 2。
+    public static func xButtonNumber(forMacNumber macNumber: Int) -> Int32 {
+        Int32(max(1, macNumber - 2))
+    }
+
+    /// Windows XButton 号 → macOS 按键号（注入方向的逆运算）。
+    public static func macNumber(forXButton x: Int32) -> Int { x == 2 ? 4 : 3 }
+
+    /// 自由映射表：本机组合 = 远端组合。
+    public var keyMappingTable = KeyMappingTable()
+
+    /// 已转发出去、当前仍处于按下状态的修饰键 VK（覆盖序列要先把它们松开再复位）。
+    private var forwardedModifiers: Set<Int32> = []
+    /// 被快捷键映射"吃掉"的主键 VK —— 它抬起时要一并吞掉，不能漏给远端。
+    private var swallowedKeys: Set<Int32> = []
+
     /// 切换状态变化回调。
     public var onSwitchChanged: ((Bool) -> Void)?
     /// 远端屏幕参考尺寸，用于把本地位移换算成远端归一化坐标。
@@ -99,6 +528,43 @@ public final class InputController {
     /// 诊断用：进入远端后记录前几个位移样本与前几个键盘包。
     private var deltaProbe = 0
     private var keyProbe = 0
+    /// 诊断用：前几次「快捷键映射命中」的日志（限流，避免刷屏）。
+    private var chordProbe = 0
+    /// 诊断用：前几次「鼠标按键被改写成快捷键」的日志。
+    private var mouseChordProbe = 0
+    /// 诊断用：前几次「侧键未映射 / 未控制远端时按侧键」的日志。
+    private var mouseSideButtonProbe = 0
+
+    // MARK: - 可编程鼠标键的手势状态
+
+    /// 一次「按住某个可编程键」的进行中状态。
+    private struct HeldButton {
+        var macButton: Int
+        /// 已判定为滚动 / 拖动 → 本次点按永久作废。
+        var cancelled = false
+        /// 点按已经发出去了（延时兜底先于松手触发）→ 松手时不要重复发。
+        var firedTap = false
+        /// 「按住拖动」里的非轴类动作已经触发过一次。
+        var firedDragOnce = false
+        /// 判定拖动的起点（屏幕坐标）。
+        var anchor: CGPoint = .zero
+        /// 点按的延时兜底任务（能取消）。
+        var timer: DispatchWorkItem?
+    }
+
+    /// 当前处于「按住」状态的可编程键，键为 macOS 按键号。
+    private var heldButtons: [Int: HeldButton] = [:]
+
+    /// 点按的延时兜底：按下后这么久仍未松手、也没滚动/拖动，就当点按发出去。
+    ///
+    /// 【为什么是 0.12s】正常一次点击的按住时长在 60~120ms；用这个值兜底
+    /// 既不会让"按住不动"迟迟没反应，也不会把"按住去滚动"误判成点按
+    /// （滚动一定发生在按住之后，几乎不可能在 120ms 内完成一次有意义的滚动）。
+    /// 松手触发的路径是**立即**的，所以快速点击根本没有延迟感。
+    private static let tapFireDelay: TimeInterval = 0.12
+
+    /// 按住拖动的手势阈值（屏幕点）。低于它视为手抖，不认作拖动。
+    private static let dragThreshold: CGFloat = 6
 
     /// 位移尺度自检：累计 |delta| 与 |location 差分|，各满 40 个有效样本后报一次比值。
     ///
@@ -342,6 +808,14 @@ public final class InputController {
     /// 本机光标是否处于「锁定」状态（正在控制远端）。
     public var cursorLocked: Bool { isControllingRemote }
 
+    /// 鼠标**移动**包的 `mouseFlags` 值（`WM_MOUSEMOVE` = 0x0200）。
+    ///
+    /// 【为什么要把这个值暴露出去】上层（Client 的发送侧）需要把"位置类"包和
+    /// "事件类"包分开处理：**位置是幂等的**（后一帧覆盖前一帧），可以安全地只保留最新一帧、
+    /// 由独立线程异步发出，从而不阻塞事件 tap；而点击/滚轮包**绝不能合并** ——
+    /// 丢一个 `WM_LBUTTONUP` 就是"远端左键卡住"，丢一个滚轮就是"少滚一格"。
+    public static let mouseMoveFlag: Int32 = WM_MOUSEMOVE
+
     /// 控制远端期间是否把本机光标钉在屏幕边缘。默认开。
     /// 关掉后本机光标会跟着物理鼠标在 Mac 上乱跑（不推荐，仅用于排查）。
     public var lockCursorWhileRemote = true
@@ -461,6 +935,9 @@ public final class InputController {
     /// 快速移动时对端的采样就越稀、越像"一格一格跳"。200Hz 足以覆盖
     /// 常见鼠标上报率，同时仍能把 1000Hz 事件流削掉 80%。
     private static let mouseMinInterval: TimeInterval = 0.005
+
+    /// 分环延迟探针（`MWB_LATPROBE=1` 时启用，默认全短路零开销）。见文件末尾的 `LatencyProbe`。
+    fileprivate var probe = LatencyProbe()
 
     /// 读取**真实**光标位置（CG 左上原点）。
     ///
@@ -623,6 +1100,7 @@ public final class InputController {
         if !force, now.timeIntervalSince(lastMouseSendAt) < Self.mouseMinInterval {
             // 被限流挡下：只置个标记，由补发定时器把"最后一次位置"送出去。
             mouseFlushPending = true
+            probe.notePending()      // 探针：记下"最后一帧"被挡下的时刻
             return
         }
         lastMouseSendAt = now
@@ -631,7 +1109,13 @@ public final class InputController {
         p.mouseFlags = WM_MOUSEMOVE
         p.mouseX = Int32(virtualRemote.x)
         p.mouseY = Int32(virtualRemote.y)
+        let probeSendStart = mach_absolute_time()
         onCaptured?(p)
+        // 探针：这一段就是 socket 阻塞写（含 AES 加密与 sendLock 等待）。
+        probe.noteSend(mach_absolute_time() - probeSendStart)
+        probe.noteFlushSent()        // 若本次是补发，结算「从被挡下到发出」的滞后
+        probe.notePacket(x: p.mouseX, y: p.mouseY)   // 探针：位置是否真的在动
+        probe.noteSendGap()          // 探针：出包节奏里有没有「突发内空洞」
 
         // 发包率统计（每 5 秒一条）：用于定位「远端不跟手」到底卡在哪一环。
         // 若这里显示 ~200Hz 而远端仍不跟手，瓶颈就不在限流，而在网络或对端注入。
@@ -692,7 +1176,10 @@ public final class InputController {
         t.schedule(deadline: .now() + Self.mouseMinInterval,
                    repeating: Self.mouseMinInterval, leeway: .milliseconds(1))
         t.setEventHandler { [weak self] in
-            guard let self, self.isControllingRemote, self.mouseFlushPending else { return }
+            guard let self else { return }
+            self.probe.noteTick()          // 探针：量 5ms 定时器的真实间隔 = 主队列调度延迟
+            if let line = self.probe.reportIfDue() { self.diag(line) }
+            guard self.isControllingRemote, self.mouseFlushPending else { return }
             self.sendMouseMovePacket(force: true)
         }
         t.resume()
@@ -1029,7 +1516,29 @@ public final class InputController {
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var captureThread: Thread?
-    private var captureThreadCancelled = false
+    /// capture 线程的**代际号**：每次 startCapture 自增，线程闭包只认自己出生那一代。
+    ///
+    /// 【为什么不能用 Bool（旧实现 `captureThreadCancelled` 的 bug）】
+    /// `stopCapture()` 把它设 true 之后，**紧接着**的 `startCapture()` 又设回 false
+    /// （startCapture 第一行就是 stopCapture）。而旧线程要等 `CFRunLoopRunInMode`
+    /// 返回（最长 0.5s）才去读这个标志 —— 那时读到的已经是被重置的 **false**，
+    /// 于是旧线程永不退出。
+    ///
+    /// 实机后果（2026-09-16 定位）：一次**断线重连**又调了一次 startCapture，
+    /// 残留的第二个 `MWBCapture` 线程，其 tap 已被 invalidate、runloop 里没有源，
+    /// `CFRunLoopRunInMode` 因 **mode 为空而立即返回**（不阻塞），while 变成纯空转
+    /// → 一个 CPU 核跑满 100%，直到进程退出。
+    /// 代际号只增不减，旧线程一读就知道自己过期了，不存在被"重置回来"的可能。
+    private var captureGeneration = 0
+    /// 当前 capture 线程真正在跑的那个 runloop。
+    /// 供 `stopCapture()` 用 `CFRunLoopStop` 唤醒它 —— 否则旧线程要等满 0.5s 超时才醒。
+    private var captureRunLoop: CFRunLoop?
+    /// **活着**的 capture 线程数（诊断/自检的客观判据）。
+    ///
+    /// 正常恒为 0 或 1。一旦出现 2 就说明旧线程没退出 —— 那正是 2026-09-16 那个
+    /// 「MWB 占满一个 CPU 核」bug 的直接特征（残留线程 runloop 无源 → 立即返回 → 空转）。
+    /// 线程进入时 +1、退出前 -1。
+    public private(set) var liveCaptureThreadCount = 0
 
     public init() {
         // 这里也读一次环境变量：自检路径（不连接 Windows）不经过
@@ -1069,7 +1578,8 @@ public final class InputController {
             type = .leftMouseDragged
         } else if injectedButtonDown.contains(CGMouseButton.right.rawValue) {
             type = .rightMouseDragged
-        } else if injectedButtonDown.contains(CGMouseButton.center.rawValue) {
+        } else if injectedButtonDown.contains(CGMouseButton.center.rawValue)
+                    || injectedButtonDown.contains(3) || injectedButtonDown.contains(4) {
             type = .otherMouseDragged
         } else {
             type = .mouseMoved
@@ -1082,8 +1592,13 @@ public final class InputController {
     }
 
     /// 注入鼠标按键。flags 为 Windows 鼠标消息；nx/ny 为当前归一化坐标。
-    public func injectMouseButton(flags: Int32, nx: Int32, ny: Int32) {
+    /// xButton：仅侧键包有意义（1=XBUTTON1 后退 / 2=XBUTTON2 前进，来自 MOUSEDATA.WheelDelta）。
+    public func injectMouseButton(flags: Int32, nx: Int32, ny: Int32, xButton: Int32 = 0) {
         let pos = mapNormalizedToScreen(nx: nx, ny: ny)
+        let isXButton = (flags == WM_XBUTTONDOWN || flags == WM_XBUTTONUP)
+        // 侧键在 macOS 上的按键号（3=后退 / 4=前进），并套用「侧键互换」，
+        // 保证与捕获侧对称：用户在 Windows 上按「后退」，到 Mac 上仍是「后退」。
+        let xMacNumber = effectiveSideButton(xButton == 2 ? 4 : 3)
         let (type, button): (CGEventType, CGMouseButton) = {
             switch flags {
             case WM_LBUTTONDOWN: return (.leftMouseDown, .left)
@@ -1092,26 +1607,38 @@ public final class InputController {
             case WM_RBUTTONUP:   return (.rightMouseUp, .right)
             case WM_MBUTTONDOWN: return (.otherMouseDown, .center)
             case WM_MBUTTONUP:   return (.otherMouseUp, .center)
+            // 侧键：Windows XBUTTON1/2 ↔ macOS otherMouse 的 button 3/4（后退/前进）。
+            // 以前这里落到 default → 注入成「鼠标移动」，用户从 Windows 按侧键会完全没反应。
+            case WM_XBUTTONDOWN: return (.otherMouseDown, .center)
+            case WM_XBUTTONUP:   return (.otherMouseUp, .center)
             default:             return (.mouseMoved, .left)
             }
         }()
         if let ev = CGEvent(mouseEventSource: nil, mouseType: type,
                             mouseCursorPosition: pos, mouseButton: button) {
+            if isXButton {
+                // 明确写按键号：3=后退 4=前进（macOS 的 mouseEventButtonNumber 约定，0 基）
+                ev.setIntegerValueField(.mouseEventButtonNumber, value: Int64(xMacNumber))
+            }
             ev.setIntegerValueField(.eventSourceUserData, value: Self.injectedTag)
             ev.post(tap: CGEventTapLocation.cghidEventTap)
         }
         // 记录注入侧的按键状态，供 injectMouseMove 决定发 mouseMoved 还是 *MouseDragged。
-        let isDown = (flags == WM_LBUTTONDOWN || flags == WM_RBUTTONDOWN || flags == WM_MBUTTONDOWN)
+        let isDown = (flags == WM_LBUTTONDOWN || flags == WM_RBUTTONDOWN
+                      || flags == WM_MBUTTONDOWN || flags == WM_XBUTTONDOWN)
+        let buttonNum: UInt32 = isXButton ? UInt32(xMacNumber) : button.rawValue
         if isDown {
-            injectedButtonDown.insert(button.rawValue)
+            injectedButtonDown.insert(buttonNum)
         } else {
-            injectedButtonDown.remove(button.rawValue)
+            injectedButtonDown.remove(buttonNum)
         }
     }
 
     /// 注入鼠标滚轮。delta 为 Windows 滚轮值（带方向）。
     public func injectMouseWheel(delta: Int32) {
-        let notch = Int(delta) / 120
+        // 接收方向反转（Windows 滚轮 → 本机）。理由见 `scrollReverseFromRemote` 注释。
+        let d = scrollReverseFromRemote ? -delta : delta
+        let notch = Int(d) / 120
         if let ev = CGEvent(scrollWheelEvent2Source: nil, units: .line,
                             wheelCount: 1,
                             wheel1: Int32(notch), wheel2: 0, wheel3: 0) {
@@ -1120,10 +1647,272 @@ public final class InputController {
         }
     }
 
+    // MARK: - 可编程鼠标键：动作执行
+
+    /// 本机已按下的修饰键（本机动作注入用；与远端注入的 `currentModifierFlags` 分开维护，
+    /// 否则"远端按住 Shift 时本机刚好执行一个动作"会把两条链路的修饰键状态串在一起）。
+    private var localModifierFlags: CGEventFlags = []
+
+    /// 本机（Mac）注入一串 VK（按下顺序；抬起按逆序）。
+    ///
+    /// 与 `injectKeyboard` 的区别：**不做** `mappedRemoteVK` 对调 ——
+    /// 那条规则是「远端发来的键要对调到本机语义」，而这里是**本机自己发起**的动作，
+    /// 再对调一次就会把 ⌘C 变成 Ctrl+C（本机语义错乱）。
+    public func postLocalKeySequence(_ vks: [Int32]) {
+        for vk in vks { postLocalKey(vk: vk, down: true) }
+        for vk in vks.reversed() { postLocalKey(vk: vk, down: false) }
+    }
+
+    private func postLocalKey(vk: Int32, down: Bool) {
+        guard let code = macKeyCode(from: vk) else { return }
+        if let mask = Self.modifierMask[vk] {
+            if down { localModifierFlags.insert(mask) } else { localModifierFlags.remove(mask) }
+        }
+        guard let ev = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down) else { return }
+        ev.flags = localModifierFlags
+        ev.setIntegerValueField(.eventSourceUserData, value: Self.injectedTag)
+        ev.post(tap: CGEventTapLocation.cghidEventTap)
+    }
+
+    /// 本机 App 级动作 —— 只有 `launchpad` 这类**没有系统快捷键可用**的。
+    public func runLocalAppAction(_ a: LocalAppAction) {
+        switch a {
+        case .launchpad:
+            let candidates = ["/System/Applications/Launchpad.app", "/Applications/Launchpad.app"]
+            for p in candidates where FileManager.default.fileExists(atPath: p) {
+                NSWorkspace.shared.open(URL(fileURLWithPath: p))
+                return
+            }
+            diag("[MWB] 启动台：找不到 Launchpad.app（系统版本较新时它可能已被移除）")
+        }
+    }
+
+    /// 发一串键盘包给远端（按下顺序；抬起逆序）。
+    private func sendRemoteKeySequence(_ vks: [Int32]) {
+        for vk in vks { sendKeyPacket(vk: vk, down: true) }
+        for vk in vks.reversed() { sendKeyPacket(vk: vk, down: false) }
+    }
+
+    /// 发一个滚轮包给远端。flags 用 WM_MOUSEWHEEL 或 WM_MOUSEHWHEEL。
+    private func sendRemoteWheel(flags: Int32, delta: Int32) {
+        guard delta != 0 else { return }
+        var p = DataPacket(type: .mouse)
+        p.mouseFlags = flags
+        p.mouseWheel = delta
+        p.mouseX = Int32(virtualRemote.x)
+        p.mouseY = Int32(virtualRemote.y)
+        onCaptured?(p)
+    }
+
+    /// 本机注入滚轮 / 缩放。`zoomByCommand` = true 时带上 ⌘（浏览器 / 看图 / Office 的缩放）。
+    private func postLocalWheel(vertical: Int32, horizontal: Int32, zoomByCommand: Bool) {
+        guard vertical != 0 || horizontal != 0 else { return }
+        guard let ev = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2,
+                               wheel1: vertical, wheel2: horizontal, wheel3: 0) else { return }
+        if zoomByCommand { ev.flags = [.maskCommand] }
+        ev.setIntegerValueField(.eventSourceUserData, value: Self.injectedTag)
+        ev.post(tap: CGEventTapLocation.cghidEventTap)
+    }
+
+    /// 轴改写类动作：把一次增量变成 滚动 / 水平滚动 / 缩放。
+    private func applyAxisDelta(_ axis: MouseAxisOp, delta: Int32, remote: Bool) {
+        guard delta != 0 else { return }
+        switch axis {
+        case .vertical:
+            if remote { sendRemoteWheel(flags: WM_MOUSEWHEEL, delta: delta) }
+            else      { postLocalWheel(vertical: delta, horizontal: 0, zoomByCommand: false) }
+        case .horizontal:
+            // 远端水平滚动：Windows 用独立的 WM_MOUSEHWHEEL 消息。
+            if remote { sendRemoteWheel(flags: WM_MOUSEHWHEEL, delta: delta) }
+            else      { postLocalWheel(vertical: 0, horizontal: delta, zoomByCommand: false) }
+        case .zoom:
+            if remote {
+                // Windows 侧缩放 = Ctrl + 滚轮。三个包走同一条 TCP，顺序有保证。
+                sendKeyPacket(vk: 0x11, down: true)
+                sendRemoteWheel(flags: WM_MOUSEWHEEL, delta: delta)
+                sendKeyPacket(vk: 0x11, down: false)
+            } else {
+                postLocalWheel(vertical: delta, horizontal: 0, zoomByCommand: true)
+            }
+        }
+    }
+
+    /// 执行一项鼠标手势设置。
+    /// - Parameters:
+    ///   - spec:  这一项的设置（已确认 `isActive`）
+    ///   - remote: true = 在 Windows 上执行；false = 在本机执行
+    ///   - axisDelta: 轴类动作的增量（滚轮 notch 或位移像素）
+    ///   - tag:   日志里手势的名字（点按 / 按住滚动 / 按住拖动）
+    private func performMouseAction(_ spec: MouseActionSpec, remote: Bool,
+                                    axisDelta: Int32, tag: String, button: Int) {
+        guard spec.isActive else { return }
+
+        if let axis = spec.action.axisOp {
+            // 增量为 0 时什么都不做，也**不打日志** —— 按住拖动的轴类动作每移动一像素
+            // 都会调到这里，零增量也记一笔会把日志刷爆。
+            guard axisDelta != 0 else { return }
+            applyAxisDelta(axis, delta: axisDelta, remote: remote)
+            mouseChordProbe += 1
+            if mouseChordProbe <= 500 {
+                diag("[MWB] 鼠标键 \(physicalButtonLabel(button)) \(tag) → "
+                     + "\(remote ? "远端" : "本机")执行 \(spec.summary)（增量 \(axisDelta)）")
+            }
+            return
+        }
+
+        let vks = remote ? spec.action.remoteVKs(custom: spec.custom)
+                         : spec.action.localVKs(custom: spec.custom)
+        if let vks, !vks.isEmpty {
+            if remote { sendRemoteKeySequence(vks) } else { postLocalKeySequence(vks) }
+            mouseChordProbe += 1
+            if mouseChordProbe <= 500 {
+                let seq = vks.map { String(format: "0x%X", $0) }.joined(separator: "→")
+                diag("[MWB] 鼠标键 \(physicalButtonLabel(button)) \(tag) → "
+                     + "\(remote ? "远端" : "本机")执行 \(spec.summary)（包序 \(seq)）")
+            }
+            return
+        }
+
+        if let app = spec.action.localAppAction {
+            runLocalAppAction(app)
+            mouseChordProbe += 1
+            if mouseChordProbe <= 500 {
+                diag("[MWB] 鼠标键 \(physicalButtonLabel(button)) \(tag) → 本机执行 \(spec.summary)")
+            }
+        }
+    }
+
+    // MARK: - 可编程鼠标键：手势判定
+
+    /// 按下 / 抬起一个可编程键。
+    ///
+    /// 返回 `nil` = 与可编程键无关（调用方继续走原来的转发逻辑）；
+    /// 返回 `true` = 已接管，调用方应**吞掉**该事件；
+    /// 返回 `false` = 已处理，但事件该继续传下去（本机侧不该拦住用户操作）。
+    private func programmableMouseButton(macButton: Int, isDown: Bool, loc: CGPoint) -> Bool? {
+        // 只接管「附加键」（中键及以上）。左 / 右键即使被配置了也不接管 ——
+        // 否则用户一旦配错就会连正常点击都用不了，且极难自救。
+        guard macButton >= 2 else { return nil }
+        guard let binding = mouseBindings.binding(for: macButton) else { return nil }
+
+        let remote = swallowingInput
+        let tapSpec    = remote ? binding.winTap    : binding.macTap
+        let scrollSpec = remote ? binding.winScroll : binding.macScroll
+        let dragSpec   = remote ? binding.winDrag   : binding.macDrag
+        let anySpec    = tapSpec.isActive || scrollSpec.isActive || dragSpec.isActive
+
+        if isDown {
+            // 三项设置一项都没生效 → 完全不接管，让老逻辑原样转发（本机则交给系统）。
+            // 也不记进 heldButtons：省得按下一个"没配置的键"时白白开一条手势状态。
+            guard anySpec else { return nil }
+            var held = HeldButton(macButton: macButton)
+            held.anchor = loc
+            // 点按的延时兜底：按住不动 120ms 就把点按发出去（松手路径是即时的）
+            if tapSpec.isActive {
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self, var h = self.heldButtons[macButton],
+                          !h.cancelled, !h.firedTap else { return }
+                    h.firedTap = true
+                    h.timer = nil
+                    self.heldButtons[macButton] = h
+                    self.performMouseAction(tapSpec, remote: remote, axisDelta: 0,
+                                            tag: "点按（按住未动，延时兜底）", button: macButton)
+                }
+                held.timer = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.tapFireDelay, execute: work)
+            }
+            heldButtons[macButton] = held
+            return true
+        }
+
+        guard let held = heldButtons.removeValue(forKey: macButton) else { return nil }
+        held.timer?.cancel()
+        if !held.cancelled, !held.firedTap, tapSpec.isActive {
+            performMouseAction(tapSpec, remote: remote, axisDelta: 0, tag: "点按", button: macButton)
+        }
+        return anySpec ? true : nil
+    }
+
+    /// 按住某个可编程键时的滚轮 → 轴改写（滚动 / 水平滚动 / 缩放）。
+    ///
+    /// 返回 `nil` = 没有可编程键被按住（走普通滚动流程）。
+    private func heldScrollAxis(delta: Int32) -> Bool? {
+        guard !heldButtons.isEmpty else { return nil }
+        let remote = swallowingInput
+        for (_, h) in heldButtons {
+            guard let b = mouseBindings.binding(for: h.macButton) else { continue }
+            let spec = remote ? b.winScroll : b.macScroll
+            guard spec.isActive, spec.action.axisOp != nil else { continue }
+            var h2 = h
+            h2.cancelled = true          // 点按作废
+            h2.timer?.cancel()
+            h2.timer = nil
+            heldButtons[h.macButton] = h2
+            performMouseAction(spec, remote: remote, axisDelta: delta * 120, tag: "按住滚动",
+                               button: h.macButton)
+            return true
+        }
+        return nil
+    }
+
+    /// 按住某个可编程键时的鼠标位移 → 「按住拖动」那一栏的设置。
+    ///
+    /// 两类行为：
+    ///  · 轴类（滚动 / 水平滚动 / 缩放）→ **持续**按位移量执行，手感像"用鼠标当滚轮"；
+    ///  · 其它（旋转、调度中心…）→ 只在**刚越过阈值**时执行一次 ——
+    ///    否则每移动一像素就发一次快捷键，一秒能灌爆对端几百个包。
+    private func heldDragGesture(loc: CGPoint) -> Bool? {
+        guard !heldButtons.isEmpty else { return nil }
+        let remote = swallowingInput
+        for (_, h) in heldButtons {
+            guard let b = mouseBindings.binding(for: h.macButton) else { continue }
+            let spec = remote ? b.winDrag : b.macDrag
+            guard spec.isActive else { continue }
+
+            let dx = loc.x - h.anchor.x
+            let dy = loc.y - h.anchor.y
+            let moved = abs(dx) > Self.dragThreshold || abs(dy) > Self.dragThreshold
+
+            if !moved {
+                // 还没越过阈值：已判为拖动的话继续吞（否则会漏给远端当成拖动）
+                return h.cancelled ? true : nil
+            }
+
+            var h2 = h
+            h2.cancelled = true
+            h2.timer?.cancel()
+            h2.timer = nil
+
+            if spec.action.axisOp != nil {
+                // 轴类：持续执行。向上 / 向左 = 减少，向下 / 向右 = 增加。
+                let step = Int32(Int((dy != 0 ? -dy : dx) / 2))
+                if step != 0 {
+                    performMouseAction(spec, remote: remote, axisDelta: step, tag: "按住拖动",
+                                       button: h.macButton)
+                }
+            } else if !h.firedDragOnce {
+                h2.firedDragOnce = true
+                performMouseAction(spec, remote: remote, axisDelta: 0,
+                                   tag: "按住拖动（越过阈值，触发一次）", button: h.macButton)
+            }
+            heldButtons[h.macButton] = h2
+            // 本机侧不吞位移：用户按住侧键时本机光标仍应正常移动（不拦住日常操作）。
+            return remote ? true : false
+        }
+        return nil
+    }
+
+    /// 离开远端 / 停止捕获时清掉进行中的手势，避免残留状态。
+    private func clearHeldButtons() {
+        for (_, h) in heldButtons { h.timer?.cancel() }
+        heldButtons.removeAll()
+    }
+
     // MARK: - 注入：键盘
 
     /// 注入键盘事件。vk = Windows 虚拟键码；flags: 0=按下, 1=抬起（对齐 KEYBDDATA.dwFlags）。
-    public func injectKeyboard(vk: Int32, flags: Int32) {
+    public func injectKeyboard(vk rawVk: Int32, flags: Int32) {
+        let vk = mappedRemoteVK(rawVk)
         guard let code = macKeyCode(from: vk) else {
             // 无法映射的键码保持静默忽略（可在此扩展 keyMap），绝不崩溃
             return
@@ -1206,7 +1995,14 @@ public final class InputController {
         let callback: CGEventTapCallBack = { _, type, event, ref in
             guard let ref else { return Unmanaged.passUnretained(event) }
             let ctrl = Unmanaged<InputController>.fromOpaque(ref).takeUnretainedValue()
-            return ctrl.handleTap(type: type, event: event)
+            // 延迟探针：把整个回调包起来，量「积压」与「处理耗时」两段。
+            // 默认关闭时只多两次 mach_absolute_time（≈50ns），可忽略。
+            let entry = mach_absolute_time()
+            let out = ctrl.handleTap(type: type, event: event)
+            ctrl.probe.noteTap(eventTimestampNs: event.timestamp,
+                               entry: entry, exit: mach_absolute_time(),
+                               kind: type.rawValue)
+            return out
         }
 
         guard let newTap = CGEvent.tapCreate(
@@ -1246,17 +2042,48 @@ public final class InputController {
         // 关键：RunLoop source 必须加在【真正运行 RunLoop 的那个线程】上。
         // 之前加在调用方线程（GUI 里是 GCD 后台队列线程），该线程的 RunLoop 从不运转，
         // 导致 tap 建好了却一个事件都收不到 —— 命令行版能工作只是碰巧主线程 RunLoop 一直在转。
-        captureThreadCancelled = false
+        //
+        // 代际号：旧线程据此判断自己是否已被取代（详见 captureGeneration 的注释）。
+        captureGeneration &+= 1
+        let myGeneration = captureGeneration
         captureThread = Thread { [weak self] in
             guard let self, let t = self.tap else { return }
+            let rl = CFRunLoopGetCurrent()
+            self.captureRunLoop = rl
+            self.liveCaptureThreadCount += 1
+            var addedSource: CFRunLoopSource?
             if let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0) {
-                CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+                addedSource = src
+                self.runLoopSource = src
+                CFRunLoopAddSource(rl, src, .commonModes)
             }
-            while !self.captureThreadCancelled {
-                _ = CFRunLoopRunInMode(.defaultMode, 0.5, true)
+            // 循环条件用代际号而非 Bool：stopCapture 自增代际号即可让本线程退出，
+            // 不会被紧接着的 startCapture 重置回去（那正是旧实现的线程泄漏根因）。
+            while self.captureGeneration == myGeneration {
+                let r = CFRunLoopRunInMode(.defaultMode, 0.5, true)
+                if self.captureGeneration != myGeneration { break }
+                // tap 已被 invalidate（stopCapture 干过）→ 源再也不会唤醒 runloop，
+                // 继续转只是空转，直接退出。
+                if !CFMachPortIsValid(t) { break }
+                // 正常路径只有两种：.timedOut（0.5s 内无事件）或 .handledSource
+                // （处理完一个事件立刻返回，为了低延迟），两者都直接重进循环。
+                // 其它返回码意味着 runloop 里已经**没有源**了 —— 此时 CFRunLoopRunInMode
+                // 会立即返回，必须退避，否则这个 while 就变成 100% CPU 的纯空转。
+                if r != .timedOut && r != .handledSource {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
+            // 退出前摘掉自己挂的源，避免给下一个 runloop / 下一代线程留垃圾。
+            if let s = addedSource { CFRunLoopRemoveSource(rl, s, .commonModes) }
+            if self.runLoopSource === addedSource { self.runLoopSource = nil }
+            if self.captureRunLoop === rl { self.captureRunLoop = nil }
+            self.liveCaptureThreadCount -= 1
+            if self.captureGeneration != myGeneration {
+                diag("[MWB] 输入捕获线程 #\(myGeneration) 已退出（被新一代取代）"
+                     + " 当前活着的捕获线程=\(self.liveCaptureThreadCount)")
             }
         }
-        captureThread?.name = "MWBCapture"
+        captureThread?.name = "MWBCapture#\(myGeneration)"
         captureThread?.start()
 
         let msg = "输入捕获已启动 ✓"
@@ -1283,13 +2110,22 @@ public final class InputController {
     public func stopCapture() {
         // 必须恢复光标关联，否则退出后鼠标就再也推不动光标了。
         releaseCursor()
-        captureThreadCancelled = true
+        // 让 capture 线程「过期」：自增代际号，旧线程下次检查即退出。
+        // 用代际号而不是 Bool —— startCapture 紧接着会重置 Bool，旧线程就永远退不掉了
+        // （详见 captureGeneration 的注释：那正是残留线程空转 100% CPU 的根因）。
+        captureGeneration &+= 1
+        // 唤醒正在阻塞的 CFRunLoopRunInMode，让它立刻返回并退出，而不是等满 0.5s 超时。
+        if let rl = captureRunLoop {
+            CFRunLoopStop(rl)
+            if let src = runLoopSource { CFRunLoopRemoveSource(rl, src, .commonModes) }
+        }
         if let t = tap {
             CGEvent.tapEnable(tap: t, enable: false)
             CFMachPortInvalidate(t)
         }
         tap = nil
         runLoopSource = nil
+        captureRunLoop = nil
         captureThread = nil
         tapActive = false
         captureEnabled = false
@@ -1377,6 +2213,10 @@ public final class InputController {
 
         switch type {
         case .mouseMoved:
+            // ★ 按住可编程键时的位移 → 「按住拖动」那一栏的设置。
+            //   只有 true（已接管）才吞；false/nil 都继续走下面的正常流程，
+            //   否则本机的边缘切换检测会被跳过。
+            if heldDragGesture(loc: loc) == true { return nil }
             return handleMouseMoved(loc, event: event)
 
         case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
@@ -1385,6 +2225,7 @@ public final class InputController {
             //
             // 未控制远端时必须原样放行 —— 否则本机自己的框选、拖窗口、拖文件
             // 会被我们吞掉（tap 挂在 headInsert 位置，吞了就是真的没反应了）。
+            if heldDragGesture(loc: loc) == true { return nil }
             guard isControllingRemote else { return Unmanaged.passUnretained(event) }
             return handleMouseMoved(loc, event: event)
 
@@ -1395,29 +2236,133 @@ public final class InputController {
             //    swallowingInput 已经是 false，放守卫之后就什么都不会发生（文件拉不回来）。
             //    回调方自己判断是否处于「对端投放态」，不在投放态时是空操作。
             if type == .leftMouseUp { onLocalLeftMouseUp?() }
+
+            // ★★ 自动捕获（高级设置里的「自动捕获」按钮）。
+            //    必须放在**所有守卫之前**：用户点捕获时鼠标通常还在本机，
+            //    而且没连上 Windows 时也要能配置。
+            //    捕获到就吞掉这次点击 —— 否则用户点一下鼠标，本机也真的点了一下。
+            if isCapturingMouseButton {
+                let captured = Int(event.getIntegerValueField(.mouseEventButtonNumber))
+                isCapturingMouseButton = false
+                diag("[MWB] 自动捕获：收到鼠标按键 macOS 号 \(captured)"
+                     + " = 物理按键 \(MouseBindingStore.physicalLabel(captured))")
+                onMouseButtonCaptured?(captured)
+                return nil
+            }
+
+            let macButton = effectiveSideButton(
+                Int(event.getIntegerValueField(.mouseEventButtonNumber)))
+            let isButtonDown = (type == .leftMouseDown || type == .rightMouseDown
+                                || type == .otherMouseDown)
+
+            // ★ 侧键体检（每次启动头 10 次按下都记，**不论是否在控制 Windows**）。
+            //
+            // 两个坑一起在这里堵掉：
+            //  ① 编号口径：macOS 的 `mouseEventButtonNumber` 是 0 基（0=左 1=右 2=中
+            //     3=第4键 4=第5键），而鼠标/驱动/Windows 按 1 基叫「Button 4/5」。
+            //     只打一个号 → 用户看到的数字永远比自己的鼠标少 1 → 必然怀疑
+            //     「后退/前进是不是接反了」（2026-09-17 用户就为此来问过一次）。
+            //     所以这里 **两个号都打**。
+            //  ② 状态口径：「侧键按了没反应」的头号原因是**那一刻鼠标还在本机** ——
+            //     映射按设计只在控制远端时生效。以前这种情况不打日志，用户只能反复按。
+            if isButtonDown, macButton >= 3, mouseSideButtonProbe < 10 {
+                mouseSideButtonProbe += 1
+                let raw = Int(event.getIntegerValueField(.mouseEventButtonNumber))
+                var extra = ""
+                if swapSideButtons, macButton != raw {
+                    extra = "（已按「侧键编号互换」翻转 → 当作 \(physicalButtonLabel(macButton))）"
+                }
+                let route: String
+                if mouseBindings.binding(for: macButton) == nil {
+                    route = swallowingInput ? "，正在控制 Windows → 未配置，原样转发给 Windows"
+                                            : "，此刻鼠标还在本机 → 未配置，原样交给系统"
+                } else {
+                    route = swallowingInput ? "，正在控制 Windows → 按「远端」那一栏执行"
+                                            : "，此刻鼠标还在本机 → 按「本机」那一栏执行"
+                }
+                diag("[MWB] 侧键体检：按下 macOS 号 \(raw) = 物理按键 \(physicalButtonLabel(raw))"
+                    + extra + route)
+            }
+
+            // 按键号：0=左 1=右 2=中 3=后退 4=前进（macOS 的 mouseEventButtonNumber）。
+            // ★ 经「侧键编号互换」换算后的**有效号**：捕获、转发给 Windows、注入三处统一用它，
+            //   否则会出现「按 XButton 是前进、按映射却是后退」这种自相矛盾。
+            let buttonNumber = macButton
+
+            // ★ 可编程鼠标键：点按 / 按住滚动 / 按住拖动（高级设置里的「鼠标按键」）。
+            //
+            // 【为什么必须放在 `guard swallowingInput` **之前**】
+            // 这套映射是**双向**的：表里「本机」那一栏要在光标还在 Mac 上时生效，
+            // 「远端」那一栏在控制 Windows 时生效。放到守卫之后，本机那一栏永远走不到。
+            //
+            // 【为什么比"在鼠标驱动里设 Cmd+C"可靠】驱动（罗技 Options+ / Karabiner 等）
+            // 合成的按键是**注入到本机**的，可能走 CGEventPostToPid 这类不经 HID tap
+            // 的路径 —— 那样我们根本看不到，跨屏自然没反应。这里直接用原始按键号改写，
+            // 与鼠标驱动做了什么无关，也不受 Command 键语义设置的影响。
+            //
+            //   nil   = 这个键没配置 → 继续走下面的原样转发（老行为）；
+            //   true  = 已接管，吞掉本次事件；
+            //   false = 已处理但不吞（本机侧，不该拦住用户的正常操作）。
+            if let swallow = programmableMouseButton(macButton: macButton,
+                                                     isDown: isButtonDown,
+                                                     loc: event.location) {
+                return swallow ? nil : Unmanaged.passUnretained(event)
+            }
+
             // 未取得远端控制权时，点击/按键都属于本机，绝不转发。
             // 自检期间同理（swallowingInput 为 false）—— 那 6 秒用户仍要能正常点本机。
             guard swallowingInput else { return Unmanaged.passUnretained(event) }
-            let (downFlag, upFlag): (Int32, Int32) = {
-                switch type {
-                case .leftMouseDown, .leftMouseUp:   return (WM_LBUTTONDOWN, WM_LBUTTONUP)
-                case .rightMouseDown, .rightMouseUp: return (WM_RBUTTONDOWN, WM_RBUTTONUP)
-                default:                             return (WM_MBUTTONDOWN, WM_MBUTTONUP)
-                }
-            }()
+
+            // ---- 未映射的按键 ----
+            // 按键号：0=左 1=右 2=中 3=后退(XBUTTON1) 4=前进(XBUTTON2) 5+=更多侧键。
+            // ★ 侧键**不能**按中键转发：Windows 的中键 = 「在浏览器里点链接新开标签」，
+            //   把侧键当中键丢过去会让用户在远端莫名其妙地开出一堆标签页。
+            //   正确做法是 WM_XBUTTONDOWN/UP + WheelDelta 里放 XBUTTON1/2（对齐 PowerToys）。
             let isDown = (type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown)
+            let (downFlag, upFlag): (Int32, Int32)
+            var xButton: Int32 = 0
+            switch type {
+            case .leftMouseDown, .leftMouseUp:
+                (downFlag, upFlag) = (WM_LBUTTONDOWN, WM_LBUTTONUP)
+            case .rightMouseDown, .rightMouseUp:
+                (downFlag, upFlag) = (WM_RBUTTONDOWN, WM_RBUTTONUP)
+            default:
+                if buttonNumber == 2 {
+                    (downFlag, upFlag) = (WM_MBUTTONDOWN, WM_MBUTTONUP)
+                } else {
+                    (downFlag, upFlag) = (WM_XBUTTONDOWN, WM_XBUTTONUP)
+                    // 3→XBUTTON1(后退), 4→XBUTTON2(前进)。buttonNumber 已过「侧键互换」，
+                    // 所以互换开着时，物理「后退」照样变成 XBUTTON1。
+                    xButton = Self.xButtonNumber(forMacNumber: buttonNumber)
+                    if mouseChordProbe < 500 {
+                        mouseChordProbe += 1
+                        diag("[MWB] 侧键 \(physicalButtonLabel(buttonNumber)) 未映射 → 作为 XButton\(xButton)"
+                            + "（\(xButton == 1 ? "后退" : "前进")）原样转发给 Windows"
+                            + "；想让它在远端等于 Ctrl+C/Ctrl+V，请在高级设置里给侧键选组合键")
+                    }
+                }
+            }
             // 记录「已转发但还没抬起」的键，离开远端时补发抬起，防止 Windows 卡在拖拽态。
             if isDown { remotePressedButtons.insert(downFlag) } else { remotePressedButtons.remove(downFlag) }
             var p = DataPacket(type: .mouse)
             p.mouseFlags = isDown ? downFlag : upFlag
+            p.mouseWheel = xButton          // 仅 XButton 包有意义，其余为 0
             p.mouseX = Int32(virtualRemote.x)
             p.mouseY = Int32(virtualRemote.y)
             onCaptured?(p)
             return nil // 远端控制时吞掉本地点击，避免同时操作两台机器
 
         case .scrollWheel:
+            let rawDy = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+
+            // ★ 按住可编程键 + 滚动 → 轴改写（滚动 / 水平滚动 / 缩放）。
+            //   必须放在 swallowingInput 守卫**之前**：本机那一栏同样要能生效。
+            if heldScrollAxis(delta: Int32(rawDy)) == true { return nil }
+
             guard swallowingInput else { return Unmanaged.passUnretained(event) }
-            let dy = event.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+            // 发送方向反转（本机滚轮 → Windows）。Mac 的「自然滚动」与 Windows 的
+            // 滚轮正负方向相反，不反转的话跨屏滚动的体感是反的。
+            let dy = scrollReverseToRemote ? -rawDy : rawDy
             var p = DataPacket(type: .mouse)
             p.mouseFlags = WM_MOUSEWHEEL
             p.mouseWheel = Int32(dy) * 120
@@ -1431,20 +2376,46 @@ public final class InputController {
             // 键盘跟随控制权：只有控制了远端才转发。
             guard swallowingInput else { return Unmanaged.passUnretained(event) }
             let rawVK = event.getIntegerValueField(.keyboardEventKeycode)
-            if let wvk = windowsVK(fromMac: Int32(rawVK)) {
-                var p = DataPacket(type: .keyboard)
-                p.keyVk = wvk
-                p.keyFlags = (type == .keyDown) ? 0 : 0x80
+            guard let wvk = windowsVK(fromMac: Int32(rawVK)) else {
                 if keyProbe < 4 {
                     keyProbe += 1
-                    diag("[MWB] 键盘包#\(keyProbe) vk=0x\(String(wvk, radix: 16))"
-                        + " \(type == .keyDown ? "按下" : "抬起")")
+                    diag("[MWB] 键盘：Mac keycode \(rawVK) 无对应 Windows VK，已忽略")
                 }
-                onCaptured?(p)
-            } else if keyProbe < 4 {
-                keyProbe += 1
-                diag("[MWB] 键盘：Mac keycode \(rawVK) 无对应 Windows VK，已忽略")
+                return nil
             }
+
+            if type == .keyUp {
+                // 被快捷键映射"吃掉"的主键：抬起也必须吞掉，否则远端会留着一个永不松开的键。
+                if swallowedKeys.remove(wvk) != nil { return nil }
+                sendKeyPacket(vk: wvk, down: false)
+                return nil
+            }
+
+            // ---- keyDown：先过一遍自由映射表 ----
+            // 源组合按**本机物理修饰键**匹配（cmd/ctrl/alt/shift），主键建议用字母/数字/F 键
+            // —— 这些键的 Mac keycode 与 Windows VK 数值相同，映射表两侧都能直接写。
+            if !keyMappingTable.isEmpty {
+                let m = event.flags
+                if let dst = keyMappingTable.match(cmd: m.contains(.maskCommand),
+                                                   ctrl: m.contains(.maskControl),
+                                                   alt: m.contains(.maskAlternate),
+                                                   shift: m.contains(.maskShift),
+                                                   vk: wvk) {
+                    applyChordOverride(dst)
+                    swallowedKeys.insert(wvk)
+                    if chordProbe < 6 {
+                        chordProbe += 1
+                        diag("[MWB] 快捷键映射：\(MWBChord.name(for: wvk)) → \(dst)（已改写，原键不再透传）")
+                    }
+                    return nil
+                }
+            }
+
+            if keyProbe < 4 {
+                keyProbe += 1
+                diag("[MWB] 键盘包#\(keyProbe) vk=0x\(String(wvk, radix: 16)) 按下")
+            }
+            sendKeyPacket(vk: wvk, down: true)
             return nil
 
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
@@ -1465,23 +2436,56 @@ public final class InputController {
 
     /// 只按修饰键（Ctrl/Cmd/Shift/Alt）时系统只发 flagsChanged、不发 keyDown/keyUp。
     /// 必须把变化单独补发成键盘包，否则对端收不到组合键的修饰部分。
+    ///
+    /// 实现方式 = **集合差分**而不是逐键 diff：先算出"当前物理修饰键对应的目标 VK 集合"，
+    /// 再与"已经转发出去的集合"求差，新增的按下去、消失的抬起来。
+    ///
+    /// 【为什么要改成集合】Command 键的语义是可配置的（`commandKeyMode`）：
+    /// 选 `Cmd→Ctrl` 时 maskControl 与 maskCommand 会**映射到同一个 VK(0x11)**，
+    /// 逐键 diff 会在两键都按下时发两次 Ctrl 按下、放开其中一个时又发 Ctrl 抬起 ——
+    /// 另一端就卡在"Ctrl 一直按着"的状态。集合差分天然免疫这种别名冲突。
     private func handleFlagsChanged(_ event: CGEvent) -> Unmanaged<CGEvent>? {
         let f = event.flags
-        let prev = lastFlags
         lastFlags = f
 
         guard swallowingInput else { return Unmanaged.passUnretained(event) }
 
-        // Mac: Shift / Control / Option(Alt) / Command(Win)
-        let defs: [(CGEventFlags, Int32)] = [(.maskShift, 0x10), (.maskControl, 0x11),
-                                             (.maskAlternate, 0x12), (.maskCommand, 0x5B)]
-        for (mask, vk) in defs where prev.contains(mask) != f.contains(mask) {
-            var p = DataPacket(type: .keyboard)
-            p.keyVk = vk
-            p.keyFlags = f.contains(mask) ? 0 : 0x80   // 0=按下, 0x80=抬起
-            onCaptured?(p)
-        }
+        // Mac: Shift / Control / Option(Alt) / Command(按 commandKeyMode 翻译)
+        var desired: Set<Int32> = []
+        if f.contains(.maskShift)     { desired.insert(0x10) }
+        if f.contains(.maskControl)   { desired.insert(0x11) }
+        if f.contains(.maskAlternate) { desired.insert(0x12) }
+        if f.contains(.maskCommand)   { desired.insert(commandKeyMode.captureVK) }
+
+        for vk in desired.subtracting(forwardedModifiers) { sendKeyPacket(vk: vk, down: true) }
+        for vk in forwardedModifiers.subtracting(desired) { sendKeyPacket(vk: vk, down: false) }
+        forwardedModifiers = desired
         return nil
+    }
+
+    /// 发一个键盘包（0 = 按下，0x80 = 抬起；与 MWB 的 `KEYBDDATA.DwFlags` 一致）。
+    private func sendKeyPacket(vk: Int32, down: Bool) {
+        var p = DataPacket(type: .keyboard)
+        p.keyVk = vk
+        p.keyFlags = down ? 0 : 0x80
+        onCaptured?(p)
+    }
+
+    /// 执行一次「组合键改写」：把本机按下的组合，换成远端要的那个组合。
+    ///
+    /// 顺序是关键（远端此刻正压着源组合的修饰键，不先松开就会变成 Ctrl+Cmd+C 这种三键组合）：
+    ///   ① 松开当前所有已转发的修饰键
+    ///   ② 按下目标修饰键
+    ///   ③ 敲一下目标主键（按下 + 抬起）
+    ///   ④ 逆序抬起目标修饰键
+    ///   ⑤ 复位：把用户物理上**仍然按着的**修饰键重新按下，避免后续输入丢掉修饰
+    private func applyChordOverride(_ dst: MWBChord) {
+        for vk in forwardedModifiers { sendKeyPacket(vk: vk, down: false) }
+        for vk in dst.modifierVKs { sendKeyPacket(vk: vk, down: true) }
+        sendKeyPacket(vk: dst.vk, down: true)
+        sendKeyPacket(vk: dst.vk, down: false)
+        for vk in dst.modifierVKs.reversed() { sendKeyPacket(vk: vk, down: false) }
+        for vk in forwardedModifiers { sendKeyPacket(vk: vk, down: true) }
     }
 
     // MARK: - 屏幕边缘切换状态机
@@ -1743,10 +2747,14 @@ public final class InputController {
         // 确定「本机位移 -> 远端归一化位移」的参考尺寸。
         // proportional: 用本机屏幕尺寸 —— 与对端分辨率完全无关，换显示器也不用改配置；
         // pixelExact:   用用户填的对端分辨率 —— 本机移动 1 像素 = 对端移动 1 像素。
-        let localFrame = localScreenFrame(containing: loc ?? lastLocalPoint)
+        //
+        // ★ 这里也必须用**主显示器**，不能像早先那样用「光标所在屏」：
+        //   多屏（Sidecar 1024x768）时光标一旦落进副屏，参考宽度变成 1024，
+        //   同样的物理位移换算出的归一化位移会放大 1.5 倍（Windows 上光标飞出去）。
+        //   而且它必须与注入侧（mapNormalizedToScreen）用同一个基准，否则来回不对称。
         switch motionScale {
         case .proportional:
-            motionRefSize = CGSize(width: localFrame.width, height: localFrame.height)
+            motionRefSize = mainScreenSize()
         case .pixelExact:
             motionRefSize = remoteScreenSize
         }
@@ -1822,6 +2830,9 @@ public final class InputController {
         //    的拖放状态机以为"拖拽被取消"，进而清掉待传文件（LastDragDropFile），
         //    我们就再也拉不到了。拖放路径的收尾由 finishFileDrop() 负责。
         if releaseButtons { releaseRemoteButtons() }
+        // 清掉进行中的「按住手势」：切换控制权时若还按着某个可编程键，
+        // 它的延时兜底任务会在切换之后才触发，把动作发到**错误的一侧**上。
+        clearHeldButtons()
         // 先停掉锁定兜底定时器/限流补发定时器、恢复「鼠标 -> 光标」关联，再做 warp，
         // 否则 warp 可能被忽略。
         stopLockTimer()
@@ -1877,12 +2888,42 @@ public final class InputController {
 
     // MARK: - 坐标映射
 
+    /// MWB 归一化坐标（0..65535）的换算基准 —— 必须是**主显示器**（带菜单栏那块）。
+    ///
+    /// ★★ 绝不能用 `NSScreen.main`。它的语义是「当前接收键盘事件的窗口所在屏幕」，
+    ///    实测在 App 无 key window 时返回「**鼠标光标当前所在的屏幕**」。
+    ///
+    ///    事故（2026-09-16）：用户接了 iPad 随航（Sidecar / AirPlay）作副屏，
+    ///    副屏分辨率正好 1024x768，主屏 1536x864。光标一旦落进副屏，
+    ///    `NSScreen.main` 就变成 1024x768 → 远端注入的归一化坐标被钳在 x≤1024
+    ///    = 主屏的 **2/3** → 现象是「Windows 的鼠标只能推到 Mac 屏幕水平 2/3 处
+    ///    就再也推不动」。而且注入出的光标又会落回副屏，形成**死锁**，永远出不来。
+    ///
+    ///    `CGMainDisplayID()` 不依赖任何窗口/焦点状态，是这里唯一稳的基准。
     private func mainScreenSize() -> CGSize {
-        if let screen = NSScreen.main {
-            return screen.frame.size
+        let b = CGDisplayBounds(CGMainDisplayID())
+        if b.width > 0, b.height > 0 {
+            logScreenBasisOnce(size: b.size)
+            return b.size
         }
+        if let s = NSScreen.screens.first { return s.frame.size }   // screens[0] = 菜单栏所在屏
         return CGSize(width: 1920, height: 1080)
     }
+
+    /// 只打一次屏幕基准，便于事后核对「为什么坐标被钳住」。
+    private func logScreenBasisOnce(size: CGSize) {
+        guard !Self.screenBasisLogged else { return }
+        Self.screenBasisLogged = true
+        let all = NSScreen.screens
+            .map { "\(Int($0.frame.width))x\(Int($0.frame.height))" }
+            .joined(separator: " / ")
+        let nsMain = NSScreen.main.map { "\(Int($0.frame.width))x\(Int($0.frame.height))" } ?? "nil"
+        diag("[MWB] 坐标基准(主显示器)=\(Int(size.width))x\(Int(size.height))"
+             + "  全部屏幕=[\(all)]  NSScreen.main=\(nsMain)"
+             + (NSScreen.screens.count > 1 ? "  ⚠️ 多屏（副屏不参与跨屏映射）" : ""))
+    }
+
+    private static var screenBasisLogged = false
 
     private func mapNormalizedToScreen(nx: Int32, ny: Int32) -> CGPoint {
         let size = mainScreenSize()
@@ -2029,6 +3070,30 @@ public final class InputController {
     /// Windows VK -> Mac keycode。
     private func macKeyCode(from vk: Int32) -> CGKeyCode? {
         Self.vkToMac[vk]
+    }
+
+    /// 注入侧：按 `commandKeyMode` 把远端修饰键**对调**到本机语义。
+    ///
+    /// 与捕获侧严格对称（对调而不是单向映射）：
+    ///   `.asControl` —— 远端 Ctrl → 本机 Command；远端 Windows 键 → 本机 Control
+    ///   `.asAlt`     —— 远端 Alt → 本机 Command；远端 Windows 键 → 本机 Option
+    ///   `.native`    —— 原样（Cmd ↔ Windows 键，MWB 原生行为）
+    ///
+    /// 【为什么是"对调"而不是"都变成 Command"】若两头都映射成 Command，
+    /// 那 Windows 上真实存在的 Ctrl 就在 Mac 上完全不可达（比如 Ctrl+点击 = 右键）。
+    /// 对调之后两种修饰键都还在，只是换了位置。
+    private func mappedRemoteVK(_ vk: Int32) -> Int32 {
+        switch commandKeyMode {
+        case .native:
+            return vk
+        case .asControl:
+            if vk == 0x11 || vk == 0xA2 || vk == 0xA3 { return 0x5B }   // Ctrl → Command
+            if vk == 0x5B || vk == 0x5C { return 0x11 }                 // Win  → Control
+        case .asAlt:
+            if vk == 0x12 || vk == 0xA4 || vk == 0xA5 { return 0x5B }   // Alt  → Command
+            if vk == 0x5B || vk == 0x5C { return 0x12 }                 // Win  → Option
+        }
+        return vk
     }
 
     /// Mac keycode -> Windows VK（捕获时反向映射）。

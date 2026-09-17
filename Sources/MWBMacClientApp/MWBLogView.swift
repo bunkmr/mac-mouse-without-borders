@@ -23,7 +23,7 @@ struct MWBLogView: View {
                     .controlSize(.small)
                 Button("在 Finder 中显示") { revealFile() }
                     .controlSize(.small)
-                Button("清空") { state.logLines.removeAll() }
+                Button("清空") { state.clearLog() }
                     .controlSize(.small)
             }
 

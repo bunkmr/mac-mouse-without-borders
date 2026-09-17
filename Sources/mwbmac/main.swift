@@ -133,6 +133,65 @@ if args.count > 1 && args[1] == "--clip-write-selftest" {
     exit(fail == 0 ? 0 : 2)
 }
 
+// `--clip-image-selftest`：图片剪贴板**线格式**的离线断言（不碰系统剪贴板、不联网）。
+// 判据来自对 PowerToys `FormHelper.cs` / `Clipboard.cs` / `SocketStuff.cs` 的逐行核对：
+//   图片载荷 = **PNG 原始字节，不压缩** → 48 字节/片 → 包 Type=ClipboardImage(125)
+//   → ClipboardDataEnd(76) 收尾；>1MB 改发 Clipboard(69) 心跳，对端回连 15100 时
+//   头里声明 `"{字节数}*image"`。
+if args.count > 1 && args[1] == "--clip-image-selftest" {
+    let (pass, total, fails) = ClipboardSync.imageSelfTest()
+    print("图片剪贴板线格式自测")
+    for f in fails { print("  ✗ \(f)") }
+    print("\n结果: \(pass)/\(total) 通过")
+    exit(fails.isEmpty ? 0 : 2)
+}
+
+// ---- 可编程鼠标键：功能清单 → 两侧键序列的映射自测 ----
+//
+// 这张表是「数据」，最容易在改一处时把另一处带坏，而它在真机上表现为
+// 「某个侧键突然什么都不做」，排查成本极高 → 必须离线可断言。
+// ---- 鼠标移动包「最新值信箱」：离线纯逻辑断言（不需要网络/对端） ----
+//
+// 【为什么必须离线断言】这套逻辑写错的症状是"远端光标偶尔跳一下 / 最后一帧压在信箱里
+// 没送出去"，真机上极难复现也极难归因；而它恰恰是跨屏 CPU 与跟手度优化的关键路径。
+if args.count > 1 && args[1] == "--mouse-mailbox-selftest" {
+    let (pass, total, fails) = MouseMoveMailbox.selfTest()
+    print("鼠标移动包信箱自测")
+    for f in fails { print("  ✗ \(f)") }
+    print("\n结果: \(pass)/\(total) 通过")
+    exit(fails.isEmpty ? 0 : 2)
+}
+
+if args.count > 1 && args[1] == "--mouse-map-selftest" {
+    let (pass, total, fails) = MouseBindingStore.selfTest()
+    print("鼠标按键映射自测")
+    for f in fails { print("  ✗ \(f)") }
+    print("\n结果: \(pass)/\(total) 通过")
+    exit(fails.isEmpty ? 0 : 2)
+}
+
+// ---- 键盘捕获：macOS 键码 → 组合键串（高级设置里"按一下键就填进去"用的映射） ----
+//
+// 【为什么必须离线断言】这张表产出的字符串会直接落进配置（`cmd+shift+z` 这种）。
+// 只要有一个键码映射错，用户在界面上按下去就会被判"非法组合"、设置静默失效，
+// 而这类错误在同一批映射里往往只错一个键，极难在真机上定位。
+if args.count > 1 && args[1] == "--keycap-selftest" {
+    let (pass, total, fails) = KeyCaptureMap.selfTest()
+    print("键盘捕获映射自测")
+    for f in fails { print("  ✗ \(f)") }
+    print("\n结果: \(pass)/\(total) 通过")
+    exit(fails.isEmpty ? 0 : 2)
+}
+
+// ---- 自定义映射表（每行 `本机 = 远端`）的解析器自测 ----
+if args.count > 1 && args[1] == "--keymap-selftest" {
+    let (pass, total, fails) = KeyMappingTable.selfTest()
+    print("自定义映射表自测")
+    for f in fails { print("  ✗ \(f)") }
+    print("\n结果: \(pass)/\(total) 通过")
+    exit(fails.isEmpty ? 0 : 2)
+}
+
 guard args.count >= 4 else {
     fputs("用法: mwbmac <windows-host> <port> <securityKey> [machineName] [myID]\n", stderr)
     exit(1)

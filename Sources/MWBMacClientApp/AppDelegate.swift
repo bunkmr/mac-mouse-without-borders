@@ -17,7 +17,21 @@ private enum K {
     static let proportional = "proportionalMapping"
     static let slot = "matrixSlot"
     static let lockCursor = "lockCursorWhileRemote"
+    static let clipImage = "clipboardImage"
+    static let cmdKeyMode = "commandKeyMode"
+    static let mouseBack = "mouseBackChord"
+    static let mouseForward = "mouseForwardChord"
+    static let swapSide = "swapSideButtons"
+    static let keyMapSpec = "keyMappingSpec"
+    /// 可编程鼠标键表（JSON）。老版本的 mouseBack / mouseForward 只在迁移时读一次。
+    static let mouseMap = "mouseButtonBindings"
+    static let scrollRevTo = "scrollReverseToRemote"
+    static let scrollRevFrom = "scrollReverseFromRemote"
 }
+
+// ⚠️ 老版本这里有个 `MouseChordOption`（把「后退 / 前进」两个侧键映射成 10 个固定组合键）。
+// 它已被「可编程鼠标键表」取代 —— 现在按键可以任意增删，每个键还有点按 / 按住滚动 /
+// 按住拖动三套手势，且本机与远端分别设置。对应的选项与编解码在 `MouseMappingView.swift`。
 
 final class AppState: ObservableObject {
 
@@ -43,6 +57,45 @@ final class AppState: ObservableObject {
     /// 控制 Windows 期间把本机光标钉在屏幕边缘（实测唯一有效的锁定方式）。
     @Published var lockCursorWhileRemote: Bool { didSet { UD.set(lockCursorWhileRemote, forKey: K.lockCursor) } }
 
+    // MARK: - 剪贴板 / 快捷键映射（高级设置）
+
+    /// 是否同步**图片**剪贴板（文本同步一直开）。
+    @Published var clipboardImageEnabled: Bool {
+        didSet {
+            UD.set(clipboardImageEnabled, forKey: K.clipImage)
+            ClipboardSync.shared.imageEnabled = clipboardImageEnabled
+        }
+    }
+
+    /// Command 键跨屏语义（原生 / Cmd→Ctrl / Cmd→Alt）。
+    @Published var commandKeyMode: CommandKeyMode {
+        didSet {
+            UD.set(commandKeyMode.rawValue, forKey: K.cmdKeyMode)
+            InputController.shared.commandKeyMode = commandKeyMode
+        }
+    }
+
+    /// 自由映射表原文：每行 `本机组合 = 远端组合`（`#` 注释）。
+    @Published var keyMappingSpec: String {
+        didSet {
+            UD.set(keyMappingSpec, forKey: K.keyMapSpec)
+            InputController.shared.keyMappingTable.load(keyMappingSpec)
+        }
+    }
+
+    /// 可编程鼠标键表：每个按键有「点按 / 按住滚动 / 按住拖动」×「本机 / 远端」共 6 项设置。
+    @Published var mouseBindings: [MouseButtonBinding] = [] { didSet { applyMouseSettings() } }
+    /// 侧键编号互换 3↔4：给「后退键被系统认成前进」的鼠标用（HID 描述符反了的少数型号）。
+    @Published var swapSideButtons: Bool { didSet { applyMouseSettings() } }
+    /// 滚轮方向反转：发给远端（Mac 滚轮 → Windows）。
+    @Published var scrollReverseToRemote: Bool { didSet { applyMouseSettings() } }
+    /// 滚轮方向反转：从远端接收（Windows 滚轮 → Mac）。
+    @Published var scrollReverseFromRemote: Bool { didSet { applyMouseSettings() } }
+    /// 鼠标按键表的回显摘要（界面显示"已配置 N 个按键"）。
+    @Published var mouseBindingsSummary = ""
+    /// 映射表解析状态回显（界面显示"已生效 N 条"）。
+    @Published var keyMappingSummary = ""
+
     // MARK: - 运行状态
 
     @Published var connected = false
@@ -64,6 +117,9 @@ final class AppState: ObservableObject {
     /// 机器矩阵快照：最多 4 台机器的槽位与联机状态。
     @Published var matrix: MatrixSnapshot?
     @Published var logLines: [String] = []
+    /// UI 侧日志缓冲（见 `scheduleLogFlush`）。
+    private var logBuffer: [String] = []
+    private var logFlushScheduled = false
     /// 日志窗口是否自动滚到底部（独立日志窗口用）。
     @Published var logAutoScroll = true
 
@@ -103,6 +159,132 @@ final class AppState: ObservableObject {
         self.slotText = UD.string(forKey: K.slot) ?? "auto"
         self.lockCursorWhileRemote = UD.object(forKey: K.lockCursor) == nil
             ? true : UD.bool(forKey: K.lockCursor)
+
+        // 图片剪贴板默认开（与 MWB 原生一致）
+        self.clipboardImageEnabled = UD.object(forKey: K.clipImage) == nil
+            ? true : UD.bool(forKey: K.clipImage)
+        // Command 键语义默认「原生」—— 不改变 MWB 既有行为，需要的人自己去高级设置里换
+        self.commandKeyMode = UD.string(forKey: K.cmdKeyMode)
+            .flatMap(CommandKeyMode.init(rawValue:)) ?? .native
+        // 可编程鼠标键表：读 JSON；空表时把老版本（≤ v1.4）的「后退 / 前进两个下拉框」
+        // 迁移过来，用户不必重配。（只在空表时迁移，不会覆盖已经建好的表）
+        var mouseStore = MouseBindingStore(json: UD.string(forKey: K.mouseMap))
+        if mouseStore.isEmpty {
+            mouseStore.migrateFromLegacy(backChord: UD.string(forKey: K.mouseBack) ?? "",
+                                         forwardChord: UD.string(forKey: K.mouseForward) ?? "")
+        }
+        self.mouseBindings = mouseStore.bindings
+        // 侧键编号互换默认关（绝大多数鼠标符合标准：物理「后退」= macOS 号 3）
+        self.swapSideButtons = UD.bool(forKey: K.swapSide)
+        // 滚轮方向默认不反转（与 MWB 原生一致；要改既有行为得用户自己开）
+        self.scrollReverseToRemote = UD.bool(forKey: K.scrollRevTo)
+        self.scrollReverseFromRemote = UD.bool(forKey: K.scrollRevFrom)
+        self.keyMappingSpec = UD.string(forKey: K.keyMapSpec) ?? ""
+
+        // 把上面这些下发到运行时（属性观察器在 init 里不触发，必须显式来一遍）
+        applyRuntimeSettings()
+    }
+
+    /// 把「高级设置」里的剪贴板/快捷键映射下发到 InputController 与 ClipboardSync。
+    func applyRuntimeSettings() {
+        ClipboardSync.shared.imageEnabled = clipboardImageEnabled
+        InputController.shared.commandKeyMode = commandKeyMode
+        InputController.shared.keyMappingTable.load(keyMappingSpec)
+        keyMappingSummary = InputController.shared.keyMappingTable.isEmpty
+            ? "未配置自定义映射"
+            : InputController.shared.keyMappingTable.summary
+        applyMouseSettings()
+    }
+
+    /// 把「可编程鼠标键表 + 滚轮方向 + 侧键编号互换」下发到运行时。
+    ///
+    /// ★ 编号口径（务必记住，否则必然怀疑"后退/前进接反了"）：
+    ///   · macOS `mouseEventButtonNumber` 是 **0 基**：0=左 1=右 2=中 3=第4键 4=第5键；
+    ///   · 鼠标包装 / 驱动面板 / Windows 一律按 **1 基**叫「Button 4 / Button 5」。
+    ///   所以「macOS 3」= 物理「Button 4」，通常就是**后退**；4 = Button 5 = 前进。
+    ///   表里存的是 macOS 号，界面显示与日志都把两个号一起给出，用户不必自己换算。
+    ///   若鼠标 HID 把两个附加键反过来报，打开 `swapSideButtons` 让 InputController
+    ///   在**换算后**再查表 —— 界面与设置里的编号不用跟着变。
+    ///
+    /// 【为什么要在 MWB 里做这件事，而不是只靠鼠标驱动软件】
+    /// 驱动（罗技 Options+ / Karabiner 等）合成的是**本机**按键；一旦光标跨到 Windows，
+    /// 要么合成事件走 `CGEventPostToPid` 这类不经 HID tap 的路径（我们根本看不到），
+    /// 要么被送成 Windows 键（Cmd→Win）而变成别的功能。在 MWB 捕获层直接改写按钮语义，
+    /// 与鼠标驱动做了什么无关，跨屏行为可预期。
+    func applyMouseSettings() {
+        var store = MouseBindingStore()
+        for b in mouseBindings { store.upsert(b) }
+
+        UD.set(store.json(), forKey: K.mouseMap)
+        UD.set(swapSideButtons, forKey: K.swapSide)
+        UD.set(scrollReverseToRemote, forKey: K.scrollRevTo)
+        UD.set(scrollReverseFromRemote, forKey: K.scrollRevFrom)
+
+        InputController.shared.mouseBindings = store
+        InputController.shared.swapSideButtons = swapSideButtons
+        InputController.shared.scrollReverseToRemote = scrollReverseToRemote
+        InputController.shared.scrollReverseFromRemote = scrollReverseFromRemote
+
+        mouseBindingsSummary = store.summary
+    }
+
+    // MARK: - 鼠标按键的自动捕获
+
+    /// 「自动捕获」是否正在进行（界面显示"正在捕获…"）。
+    @Published var capturingMouseButton = false
+    /// 捕获结果提示（界面上一行字）。
+    @Published var mouseCaptureHint = ""
+
+    /// 开始捕获：**下一次鼠标按下**会被 InputController 上报出来，并被吞掉
+    /// （不然用户点一下鼠标，本机也真的点了一下）。
+    ///
+    /// 【为什么要这个功能】用户不该被迫去查"我这个键是几号"——
+    /// macOS 内部 0 基、鼠标包装 1 基，差 1 极容易搞反（2026-09-17 用户就为此问过）。
+    /// 按一下让程序自己认，是唯一不会出错的方式。
+    func beginMouseButtonCapture() {
+        guard !capturingMouseButton else { return }
+        capturingMouseButton = true
+        mouseCaptureHint = "请按一下鼠标上要配置的按键（左键 / 右键除外）…"
+        InputController.shared.onMouseButtonCaptured = { [weak self] macButton in
+            // 回调来自捕获线程，界面更新必须回主线程
+            DispatchQueue.main.async { self?.finishMouseButtonCapture(macButton) }
+        }
+        InputController.shared.isCapturingMouseButton = true
+    }
+
+    /// 捕获结束（拿到按键号）。
+    func finishMouseButtonCapture(_ macButton: Int) {
+        capturingMouseButton = false
+        InputController.shared.onMouseButtonCaptured = nil
+        // 左 / 右键不接管：真接管了用户会发现「点了没反应」，而且极难自救
+        guard macButton >= 2 else {
+            mouseCaptureHint = "捕获到「\(MouseBindingStore.physicalLabel(macButton))」—— "
+                + "左键 / 右键不支持映射（会让鼠标无法正常点击）"
+            return
+        }
+        if mouseBindings.contains(where: { $0.macButton == macButton }) {
+            mouseCaptureHint = "「\(MouseBindingStore.physicalLabel(macButton))」已经在列表里了"
+            return
+        }
+        // 新建的条目一律默认「不映射」—— 不替用户决定用途，只引导他去选。
+        let b = MouseButtonBinding(macButton: macButton)
+        mouseBindings.append(b)
+        mouseBindings.sort { $0.macButton < $1.macButton }
+        mouseCaptureHint = "已添加 \(b.displayName) —— 请在它下面选择要执行的动作"
+    }
+
+    func removeMouseBinding(id: UUID) {
+        mouseBindings.removeAll { $0.id == id }
+        mouseCaptureHint = ""
+    }
+
+    /// 取消一个进行中的捕获（面板收起时调用，避免一直挂着一个"下一次点击被吞"的状态）。
+    func cancelMouseButtonCapture() {
+        guard capturingMouseButton else { return }
+        capturingMouseButton = false
+        InputController.shared.isCapturingMouseButton = false
+        InputController.shared.onMouseButtonCaptured = nil
+        mouseCaptureHint = ""
     }
 
     // MARK: - 日志
@@ -114,12 +296,20 @@ final class AppState: ObservableObject {
         let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"; return f
     }()
 
+    /// 追加一行日志（落盘 + 界面）。
+    ///
+    /// ★ UI 侧**合并更新**，不是每行都刷：`logLines` 是 `@Published`，而面板观察整个
+    ///   `AppState` —— 每追加一行都会让面板整体重算一次。连接成功那一下会一口气写 40+ 行，
+    ///   实测让面板在这一秒里吃掉 40% CPU（面板开着时就是肉眼可见地"卡一下"）。
+    ///   现在 UI 最多 4 次/秒更新一次：日志窗口看起来仍是实时的，但一次连接从 40+ 次
+    ///   重算降到几次。**落盘（/tmp/mwb_gui.log）一行不少、时序不变**。
     func appendLog(_ s: String) {
         // 带毫秒时间戳：排查「切过去又被立刻踢回」这类时序问题时没有时间戳根本看不出来
         let line = "[\(Self.logTime.string(from: Date()))] \(s)"
         DispatchQueue.main.async {
-            self.logLines.append(line)
-            if self.logLines.count > 200 { self.logLines.removeFirst(self.logLines.count - 200) }
+            self.logBuffer.append(line)
+            if self.logBuffer.count > 200 { self.logBuffer.removeFirst(self.logBuffer.count - 200) }
+            self.scheduleLogFlush()
         }
         logQueue.async {
             guard let d = (line + "\n").data(using: .utf8) else { return }
@@ -128,6 +318,24 @@ final class AppState: ObservableObject {
             } else {
                 try? d.write(to: self.logFile)
             }
+        }
+    }
+
+    /// 清空界面日志（日志窗口的「清空」按钮、重连前都要用同一份缓冲，否则下一次刷新会把
+    /// 已清掉的行又刷回来）。
+    func clearLog() {
+        logBuffer.removeAll()
+        logLines.removeAll()
+    }
+
+    /// 把缓冲里的日志合并刷新到 UI（最多 4 次/秒）。
+    private func scheduleLogFlush() {
+        guard !logFlushScheduled else { return }
+        logFlushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self else { return }
+            self.logFlushScheduled = false
+            if self.logLines != self.logBuffer { self.logLines = self.logBuffer }
         }
     }
 
@@ -164,9 +372,17 @@ final class AppState: ObservableObject {
         axTrusted = AXIsProcessTrusted()
         connecting = true
         statusText = "连接中…"
-        logLines.removeAll()
+        clearLog()
 
         // 注意：所有配置要在 run() 之前设好 —— run() 内部会据此建立连接
+        applyRuntimeSettings()
+        appendLog("[GUI] 快捷键映射：Command 键=\(commandKeyMode.displayName)"
+                  + "；自定义映射 \(keyMappingSummary)")
+        appendLog("[GUI] 鼠标按键：\(mouseBindingsSummary)"
+                  + "；滚轮反转 发送=\(scrollReverseToRemote ? "开" : "关")"
+                  + " 接收=\(scrollReverseFromRemote ? "开" : "关")"
+                  + "；编号互换=\(swapSideButtons ? "开（macOS 号 3↔4）" : "关")")
+        appendLog("[GUI] 图片剪贴板同步=\(clipboardImageEnabled ? "开" : "关")")
         let c = MWBClient(host: host, port: port, securityKey: securityKey, machineName: machineName)
         c.preferredEdge = edge
         // 位移映射方式：默认按本机屏幕比例（协议原生，与对端分辨率无关）
@@ -217,8 +433,13 @@ final class AppState: ObservableObject {
         }
 
         // 控制权切换 -> 面板顶部状态实时反映「本机 / Windows」
-        c.input.onSwitchChanged = { [weak self] remote in
+        c.input.onSwitchChanged = { [weak self, weak c] remote in
             DispatchQueue.main.async { self?.controllingRemote = remote }
+            // ★ 交给 Windows 的那一刻补发 MachineSwitched(77)：PowerToys 的
+            //   `Clipboard.GetRemoteClipboard` 就挂在这个包上 —— Windows 收到它（且 30 秒内
+            //   收到过我们的心跳）才会回连 15100 把 >1MB 的图片/文本拉走。真实照片基本都 >1MB。
+            //   注：必须弱引用 c，否则 c.input.onSwitchChanged 会把 c 强引用住（循环引用）。
+            if remote { c?.handedControlToRemote() }
         }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -270,19 +491,25 @@ final class AppState: ObservableObject {
 
     /// 轮询捕获健康度：让面板能显示「到底有没有真的收到本地输入事件」。
     /// 授权界面里勾了不代表生效 —— 事件数为 0 就一定是 permissions 没落到这个二进制上。
+    ///
+    /// ★ **只在值真的变了才写**（`@Published` 一写就整个面板重算一次）。
+    ///   过去这里是无条件赋值：面板开着时每 1.5 秒必刷一次，而面板里「鼠标按键」那 12 个
+    ///   下拉菜单每次重算都要重建，实测持续吃 13~20% CPU。现在静止状态下一次都不刷。
+    ///   事件计数（鼠标/键盘）本来就会随手一动就变，所以那种情况下仍会刷新 —— 但那是
+    ///   真实变化，面板上确实该显示新数字。
     private func startHealthPolling() {
         DispatchQueue.main.async {
             self.pollTimer?.invalidate()
-            self.pollTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            self.pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
                 guard let self, let c = self.client else { return }
                 let h = c.input.captureHealth()
                 let snap = c.matrix.snapshot()
                 let listening = CGPreflightListenEventAccess()
                 DispatchQueue.main.async {
-                    self.tapEvents = h.events
-                    self.keyEvents = h.keyEvents
-                    self.matrix = snap          // 在线/离线是时间相关的，周期刷新
-                    self.inputMonitoringOK = listening
+                    if self.tapEvents != h.events { self.tapEvents = h.events }
+                    if self.keyEvents != h.keyEvents { self.keyEvents = h.keyEvents }
+                    if self.matrix != snap { self.matrix = snap }   // 在线/离线是时间相关的
+                    if self.inputMonitoringOK != listening { self.inputMonitoringOK = listening }
                 }
             }
         }
@@ -382,7 +609,7 @@ private func extractName(_ s: String) -> String {
 
 // MARK: - 菜单栏
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let state = AppState()
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
@@ -404,6 +631,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popover.contentViewController = NSHostingController(rootView: ContentView(state: state))
         popover.behavior = .transient
+        popover.delegate = self
 
         // 状态变化时刷新菜单栏图标
         state.$connected.sink { [weak self] on in
@@ -577,21 +805,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
 
-                // ① 全部内容（高度给足，看真实总高）
+                // ① 当前页签的全部内容（高度给足，看真实总高）
+                //
+                // 注意面板是「固定栏 + 可滚动内容」结构：头部状态条、页签栏、底栏都不参与滚动，
+                // 所以判断"会不会显示不全"要拿「页签内容高」跟「面板高 − 固定栏」比，
+                // 不能跟面板总高比。固定栏实测约 124pt（头部 53 + 页签栏 33 + 底栏 37 + 分隔线）。
+                let cap = ContentView.panelHeight
                 let full = snap(PanelSnapshot(state: self.state)
                                     .frame(width: 372)
                                     .background(Color(nsColor: .windowBackgroundColor)),
                                 to: out, maxHeight: 20_000)
                 if let full {
-                    self.state.appendLog("[GUI] 面板内容总高 = \(Int(full.height))pt（Popover 上限 560pt）"
-                        + (full.height > 560 ? " ⚠️ 超出，需滚动" : " ✅ 可完整显示"))
+                    let chrome: CGFloat = 124
+                    let usable = cap - chrome
+                    let tab = ProcessInfo.processInfo.environment["MWB_RENDER_TAB"] ?? "basics"
+                    self.state.appendLog("[GUI] 页签 \(tab) 内容高 = \(Int(full.height))pt"
+                        + "（面板 \(Int(cap))pt − 固定栏 \(Int(chrome))pt = 可用 \(Int(usable))pt）"
+                        + (full.height > usable ? " ⚠️ 超出，需滚动" : " ✅ 可完整显示"))
                 }
 
-                // ② 真实 Popover 外观
+                // ② 真实 Popover 外观（与用户实际所见同尺寸）
                 let dir = (out as NSString).deletingLastPathComponent
                 snap(PopoverSnapshot(state: self.state)
                         .background(Color(nsColor: .windowBackgroundColor)),
-                     to: dir + "/popover.png", maxHeight: 560)
+                     to: dir + "/popover.png", maxHeight: cap)
 
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { exit(0) }
             }
@@ -658,9 +895,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.performClose(sender)
         } else {
             state.axTrusted = AXIsProcessTrusted()
+            // ★ 显式给出面板尺寸（而不是让 NSPopover 按内容自适应）：
+            //   自适应会把面板压到"刚好装下内容"的高度（实测 478pt），而内容一展开
+            //   「高级设置」就超了，用户只能在小窗口里滚。这里按屏幕可用高度撑开。
+            popover.contentSize = NSSize(width: 372, height: ContentView.panelHeight)
             popover.show(relativeTo: btn.bounds, of: btn, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
         }
+    }
+
+    // MARK: - 面板生命周期
+
+    /// 面板收起时清掉「正在等用户按键 / 点鼠标」的两种捕获状态。
+    ///
+    /// 【为什么必须做】两种捕获都在等"下一次输入"，而它们都有副作用：
+    ///   · 键盘捕获挂的是 `NSEvent` 局部监听 —— App 不再是活动状态就收不到键，
+    ///     界面会永远停在「正在捕获…」，监听器还一直挂着；
+    ///   · 鼠标捕获会**吞掉**下一次鼠标点击 —— 面板已经收起还挂着，用户点别处会莫名没反应。
+    /// 收起就清干净，保证"没在配置时"的行为与往常完全一致。
+    func popoverDidClose(_ notification: Notification) {
+        KeyCaptureEngine.shared.cancel()
+        state.cancelMouseButtonCapture()
     }
 
     // MARK: - 退出 / 菜单
