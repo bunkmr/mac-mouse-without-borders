@@ -1122,13 +1122,23 @@ public final class InputController {
         mouseSendCount += 1
         let span = now.timeIntervalSince(lastMouseStatAt)
         if span > 5 {
+            // ★ 造帧数 ≠ 发出数，两者必须一起报。
+            //   「造了 600 帧、实发 0 帧」= 发送线程停摆 —— 那正是 2026-09-19 那个
+            //   「键盘能用、鼠标不动、Windows 上看不到光标」的形态。
+            //   当时日志里只有造帧数（100Hz+ 一片祥和），故障被瞒了很久，这次一并报出来。
             diag("[MWB] 鼠标包发送率 = \(mouseSendCount) 包 / \(String(format: "%.1f", span))s"
                  + " ≈ \(Int(Double(mouseSendCount) / span))Hz"
-                 + "（上限 \(Int(1.0 / Self.mouseMinInterval))Hz）")
+                 + "（上限 \(Int(1.0 / Self.mouseMinInterval))Hz）"
+                 + (mouseDeliveryProbe?() ?? ""))
             mouseSendCount = 0
             lastMouseStatAt = now
         }
     }
+
+    /// 真实投递统计的读取口（由 `Client` 注入，读的是信箱计数 + 发送线程存活状态）。
+    ///
+    /// 与 `mouseSendCount`（造帧数）分开，才能一眼看出"造了却一包没发出去"。
+    public var mouseDeliveryProbe: (() -> String)?
 
     private var mouseSendCount = 0
     private var lastMouseStatAt = Date()

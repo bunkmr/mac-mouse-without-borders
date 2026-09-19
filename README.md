@@ -62,9 +62,9 @@ Windows 上的「无界鼠标」只能让 Windows 电脑之间互联。这个程
 
 ### 第 1 步：下载
 
-👉 **前往 [Releases 页面](https://github.com/bunkmr/mac-mouse-without-borders/releases/latest) 下载 `MWB-v1.4.1-universal.dmg`**（约 2.1 MB）
+👉 **前往 [Releases 页面](https://github.com/bunkmr/mac-mouse-without-borders/releases/latest) 下载 `MWB-v1.4.2-universal.dmg`**（约 2.1 MB）
 
-也可以直接下仓库里的那份：[dist/MWB-v1.4.1-universal.dmg](dist/MWB-v1.4.1-universal.dmg)。
+也可以直接下仓库里的那份：[dist/MWB-v1.4.2-universal.dmg](dist/MWB-v1.4.2-universal.dmg)。
 
 ### 第 2 步：安装
 
@@ -146,6 +146,28 @@ xattr -dr com.apple.quarantine /Applications/MWB.app
 ---
 
 ## 更新记录
+
+### v1.4.2（2026-09-19）
+
+- 🐛 **修掉「偶尔显示已连接、但鼠标跨到 Windows 后完全不显示」的故障**。
+  现象很迷惑人：状态条显示已连接，**键盘打字、点击在 Windows 上照常生效**，
+  只有鼠标指针在那边**连影子都没有**。
+  根因是**鼠标移动与键鼠操作走的是两条不同的发送路径** ——
+  鼠标移动走独立发送线程，而断线时这条线程会被停掉，重连成功时**没人把它重新拉起来**
+  ⇒ 从此每一个鼠标位置都只是把队里的旧位置顶掉、**一包也发不出去**，
+  直到重启 App 才恢复。所以「键盘能用」根本不能证明鼠标那条路是通的。
+  现在**重连成功时显式重启发送线程**（这是主修复）。
+- ✨ **新增 1 秒哨兵自愈**：无论线程是被断线、重连还是将来任何新的退出路径停掉的，
+  只要「队里压着鼠标位置、链路正常、却超过 1 秒一帧都没交付」，就**自动重启并记一条日志**。
+  这把「永久失效直到重启 App」降级为「最多 1 秒的自我恢复」。
+- ✨ **日志能一眼看出有没有在真发**：以前只报鼠标「造帧率」，
+  故障时它照样是一片 100Hz+ 的祥和数字，把问题瞒住了；现在**同时报出
+  「投递 / 实发 / 积压 / 发送线程是否存活」**，`实发 0` 且投递在涨 = 立刻可见。
+- ⚡ 发送线程改为**定时唤醒（0.2 秒）**，不再无限期阻塞等待 ——
+  即使出现极端卡死，最坏也只是 0.2 秒的滞后，而不是永久停摆。
+- 🐛 修复**定向包的目标机器 ID 可能被随机值污染**：学习对端机器 ID 时排除掉握手包
+  （它的源 ID 是随机模板值，不是真实机器号）。此前会影响**文件拖放**与
+  **大图剪贴板**这两条需要"指定发给谁"的路径。
 
 ### v1.4.1（2026-09-17）
 
@@ -249,7 +271,7 @@ Apple 设备直连功能时，就必须**周期性地离开路由器信道**去�
 想自己确认一下（Mac 上打开「终端」）：
 
 ```bash
-ping -c 120 -i 0.05 192.168.2.1    # 换成你自己路由器的地址
+ping -c 120 -i 0.05 192.168.1.1    # 换成你自己路由器的地址
 ```
 
 - 如果 `max` 明显比 `avg` 大（例如 avg 2ms 但 max 100ms+），并且**大致每隔 10 个包出现一次**，
@@ -319,7 +341,7 @@ no extra software needed on the Windows side.
 
 **Install**
 
-1. Download `dist/MWB-v1.4.1-universal.dmg`
+1. Download `dist/MWB-v1.4.2-universal.dmg`
 2. Drag `MWB.app` into `/Applications`
 3. The app is not notarized, so run once:
    ```bash

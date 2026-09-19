@@ -162,6 +162,20 @@ if args.count > 1 && args[1] == "--mouse-mailbox-selftest" {
     exit(fails.isEmpty ? 0 : 2)
 }
 
+// ---- 鼠标发送线程的哨兵判据（"该不该重启发送线程"）：离线纯逻辑断言 ----
+//
+// 【为什么必须离线断言】对应 bug 的现场极其反直觉：连接正常、键盘能用、日志里
+// "鼠标包发送率"还有 100Hz+（那统计的是造帧数），**只有鼠标移动彻底不动**，
+// 而 Windows 侧连光标都不显示（它跨屏时用自己画的假光标，只有收到鼠标包才显示）。
+// 判据要是写错，要么救不回来（漏判），要么在鼠标静止时疯狂重启线程（误判）。
+if args.count > 1 && args[1] == "--mouse-sender-supervisor-selftest" {
+    let (pass, total, fails) = MouseSenderSupervisor.selfTest()
+    print("鼠标发送线程哨兵判据自测")
+    for f in fails { print("  ✗ \(f)") }
+    print("\n结果: \(pass)/\(total) 通过")
+    exit(fails.isEmpty ? 0 : 2)
+}
+
 if args.count > 1 && args[1] == "--mouse-map-selftest" {
     let (pass, total, fails) = MouseBindingStore.selfTest()
     print("鼠标按键映射自测")
@@ -204,11 +218,11 @@ let key = args[3]
 /// MWB 靠「机器名」识别每台机器，Windows 端 MWB 里填的名字必须和这里发出的完全一致，
 /// 否则对方会把我们当成未知机器 → 不加进机器矩阵 → 认证通过但之后完全静默。
 /// 规则与 Windows 一致: 用主机名原样(小写/含连字符)，不要空格。
-/// 优先 LocalHostName(MacBook-Pro-2)，其次 hostname 去掉 .local，最后兜底 "Mac"。
+/// 优先 LocalHostName(MacBook-Pro)，其次 hostname 去掉 .local，最后兜底 "Mac"。
 func defaultMachineName() -> String {
     var candidates: [String] = []
 
-    // 1) LocalHostName (系统设置→共享 里的名称, 如 "MacBook-Pro-2")
+    // 1) LocalHostName (系统设置→共享 里的名称, 如 "MacBook-Pro")
     if let ln = SCDynamicStoreCopyLocalHostName(nil) as String? {
         candidates.append(ln)
     }

@@ -306,7 +306,7 @@ struct ContentView: View {
     @ViewBuilder
     private var localMachineSection: some View {
         row("本机名称") {
-            TextField("MacBook-Pro-2", text: $state.machineName).textFieldStyle(.roundedBorder)
+            TextField("MacBook-Pro", text: $state.machineName).textFieldStyle(.roundedBorder)
         }
 
         HStack(spacing: 6) {

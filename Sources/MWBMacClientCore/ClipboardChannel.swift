@@ -620,7 +620,7 @@ public final class MWBClipboardChannel {
         // ★★ 必须把 Windows 的反斜杠归一化，否则整条路径会变成文件名 ★★
         //
         // 对端发来的头里是 **Windows 路径**，实测长这样：
-        //   C:\Users\bunkr\Desktop\MouseWithoutBorders\PixPin_2026-08-30_21-39-51.png
+        //   C:\Users\YourName\Desktop\MouseWithoutBorders\PixPin_2026-08-30_21-39-51.png
         // 而 `NSString.lastPathComponent` **只认 "/"** —— 遇到反斜杠路径它会原样返回，
         // 于是我们把「整条路径」当成了文件名。更坑的是 macOS 里 ":" 是合法字符
         // 但 Finder 会把它**显示成 "/"**，所以用户看到的名字就是一条完整路径

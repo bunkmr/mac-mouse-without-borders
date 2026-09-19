@@ -187,3 +187,107 @@ public final class MouseMoveMailbox {
         return (pass, pass + fails.count, fails)
     }
 }
+
+// MARK: - 鼠标发送线程的哨兵判据
+
+/// 「该不该把鼠标移动包的发送线程重启一次」——**纯函数**，与网络/线程无关，可离线自检。
+///
+/// 【为什么要有它】`MouseMoveMailbox` 那套"只在空→非空时唤醒发送线程"的约定，
+/// 只要有任何一条路径破坏它（最常见的一条：**断链时 `handleLinkDead` 停掉了发送线程，
+/// 而"自动重连成功"只重启了接收循环**），鼠标移动就会**永久**停住：
+/// 每一帧都只是把信箱里的旧帧顶掉、永远发不出去。
+/// 而键盘/点击/滚轮走的是另一条同步发送路径，照样通 ——
+/// 于是现象是「连接正常、键盘能用，就是鼠标不动、**Windows 屏幕上连光标都看不到**」
+/// （PowerToys 侧跨屏时显示的是它自己画的假光标，只有收到鼠标包才会显示）。
+///
+/// 判据四个条件缺一不可：
+///   · `isPending`      —— 信箱里确实压着一帧没发（有活没干完，才谈得上"停摆"）；
+///   · `deliveredAgo >` —— 已经这么久没有**真正写进 socket**（注意：不是"造帧"）；
+///   · `!linkDead`      —— 链路已死时重启没意义，重连成功那条路径会负责重启；
+///   · `handledAgo >`   —— 节流，避免反复重启刷日志。
+///
+/// 自检：`mwbmac --mouse-sender-supervisor-selftest`
+public enum MouseSenderSupervisor {
+    /// 判定"停摆"。阈值默认：1s 没交付过 + 5s 内没处理过。
+    public static func shouldRestart(isPending: Bool,
+                                     deliveredAgo: TimeInterval,
+                                     linkDead: Bool,
+                                     handledAgo: TimeInterval,
+                                     stallSeconds: TimeInterval = 1.0,
+                                     cooldown: TimeInterval = 5.0) -> Bool {
+        guard isPending, !linkDead else { return false }
+        return deliveredAgo > stallSeconds && handledAgo > cooldown
+    }
+
+    /// 离线自检：把边界条件钉死（含 2026-09-19 那次故障的真实参数组合）。
+    public static func selfTest() -> (pass: Int, total: Int, fails: [String]) {
+        var pass = 0
+        var fails: [String] = []
+        func check(_ name: String, _ cond: Bool) {
+            if cond { pass += 1 } else { fails.append(name) }
+        }
+
+        // ① 典型故障现场：断链重连之后 —— 链路已恢复(linkDead=false)、信箱压着位置、
+        //    已经 12s 没有任何真正的交付、且距上次处理很久（从没处理过）。
+        check("断链重连后（有帧/久未交付/链路活）→ 该重启",
+              shouldRestart(isPending: true, deliveredAgo: 12, linkDead: false,
+                            handledAgo: .greatestFiniteMagnitude))
+
+        // ② 信箱空 = 没活干：鼠标没动时本来就该是空的，绝不能据此重启
+        check("信箱空（没压帧）→ 不重启",
+              !shouldRestart(isPending: false, deliveredAgo: 99, linkDead: false,
+                             handledAgo: 99))
+
+        // ③ 链路已死：重启也没用，交给"重连成功"那条路径
+        check("链路已死 → 不重启",
+              !shouldRestart(isPending: true, deliveredAgo: 99, linkDead: true, handledAgo: 99))
+
+        // ④ 刚刚交付过：说明发送线程在正常工作（哪怕信箱里还压着下一帧）
+        check("0.5s 前刚交付过 → 不重启（还没到 1s 判据）",
+              !shouldRestart(isPending: true, deliveredAgo: 0.5, linkDead: false,
+                             handledAgo: .greatestFiniteMagnitude))
+
+        // ⑤ 节流：刚处理过一次（重启过），别在冷却期内反复重启
+        check("距上次处理 2s（冷却 5s 未到）→ 不重启",
+              !shouldRestart(isPending: true, deliveredAgo: 99, linkDead: false, handledAgo: 2))
+
+        // ⑥ 边界：正好等于阈值不算（用 > 而非 >=），避免"卡在阈值上"抖动
+        check("deliveredAgo 恰等于阈值 1.0 → 不重启",
+              !shouldRestart(isPending: true, deliveredAgo: 1.0, linkDead: false,
+                             handledAgo: .greatestFiniteMagnitude))
+        check("handledAgo 恰等于冷却 5.0 → 不重启",
+              !shouldRestart(isPending: true, deliveredAgo: 99, linkDead: false, handledAgo: 5.0))
+
+        // ⑦ 阈值可调（自检/实验用）
+        check("自定义阈值（0.2s/0.1s）下 0.5s 未交付 → 该重启",
+              shouldRestart(isPending: true, deliveredAgo: 0.5, linkDead: false,
+                            handledAgo: 1, stallSeconds: 0.2, cooldown: 0.1))
+
+        // ⑧ 组合穷举：只有 (有帧 ∧ 链路活 ∧ 超时 ∧ 过冷却) 这一种组合为真
+        var trueCases = 0
+        var comboMismatch = 0
+        for pending in [true, false] {
+            for dead in [true, false] {
+                for delivered in [0.1, 9.0] {
+                    for handled in [0.5, 9.0] {
+                        let r = shouldRestart(isPending: pending, deliveredAgo: delivered,
+                                              linkDead: dead, handledAgo: handled,
+                                              stallSeconds: 1.0, cooldown: 5.0)
+                        let want = pending && !dead && delivered > 1.0 && handled > 5.0
+                        if r != want {
+                            comboMismatch += 1
+                            fails.append("组合穷举: pending=\(pending) dead=\(dead) "
+                                         + "delivered=\(delivered) handled=\(handled) "
+                                         + "→ \(r)，期望 \(want)")
+                        }
+                        if r { trueCases += 1 }
+                    }
+                }
+            }
+        }
+        check("16 种组合穷举全部一致", comboMismatch == 0)
+        check("16 种组合里恰有 1 种为真", trueCases == 1)
+
+        return (pass, pass + fails.count, fails)
+    }
+}

@@ -107,6 +107,23 @@ public final class MWBClient {
     /// 唤醒发送线程的信号量。只在信箱"空 → 非空"时 signal 一次。
     let mouseMailboxSignal = DispatchSemaphore(value: 0)
     private var mouseSenderThread: Thread?
+    /// 发送线程空闲时的轮询间隔（秒）。
+    ///
+    /// 【为什么不能"无限期 wait"】只靠信号量的话，只要有**任何一条路径**让
+    /// "信箱里有帧、却没人再发信号"，鼠标移动就**永久**停住 —— 而键盘/点击走的是
+    /// 另一条同步发送路径，照样通。于是现象极具迷惑性：
+    /// 「连接正常、键盘能用，就是鼠标不动、Windows 屏幕上连光标都看不到」。
+    /// 定时唤醒把最坏情况从"永久卡死"降级为"最多 0.2s 的滞后"。
+    static let mouseSenderIdlePoll: TimeInterval = 0.2
+    /// 上一次**真的写进 socket** 的时刻（由发送线程在成功后更新）。
+    ///
+    /// 必须与 `sendMouseMovePacket` 里那个"生成率"计数器分开看：那个统计的是"造了多少帧"，
+    /// 而"造出来了却一帧都没发出去"正是本 bug 的形态（日志里显示 99Hz，看着一切正常）。
+    private var mouseDeliveredAt = Date.distantPast
+    /// 自愈重启的节流时刻（避免"链路正常但信箱长期压着帧"时反复重启刷日志）。
+    private var mouseStallHandledAt = Date.distantPast
+    /// 累计自愈重启次数（日志里会报，便于回头判断这套兜底有没有真的在起作用）。
+    private var mouseStallRestarts = 0
     /// 发送线程的**代际号**（只增不减）。
     ///
     /// 【为什么不能用 Bool】与本项目捕获线程踩过的坑一模一样：`startMouseMoveSender()`
@@ -131,18 +148,36 @@ public final class MWBClient {
         stopMouseMoveSender()
         mouseSenderGeneration += 1
         let gen = mouseSenderGeneration
+        // 新线程从"现在"开始计交付时刻：给它 1 个 watchdog 周期的宽限，
+        // 免得刚起来就被判定成"卡住"而反复自杀重启。
+        mouseDeliveredAt = Date()
         let t = Thread { [weak self] in
             while let s0 = self, s0.mouseSenderGeneration == gen {
-                s0.mouseMailboxSignal.wait()
+                // ★ 定时唤醒，而不是无限期 `wait()`。
+                //
+                // 【为什么】信号量那套"只在空→非空时唤醒"的约定，**任何一次破坏都是永久性故障**：
+                //   ① 发送失败 `break` 时信箱里可能还压着更新的一帧 → 投递方以为"信箱非空、
+                //      发送线程本来就会取"，于是再也不 signal，而线程已经睡死；
+                //   ② 线程被 `stopMouseMoveSender()` 停掉后若没人重启（**实测就是这条**：
+                //      `handleLinkDead` 会停线程，而"自动重连成功"只重启了接收循环）——
+                //      之后每一帧都只会把信箱里的旧帧顶掉，永远不出去。
+                //   症状：键盘、点击、滚轮全部正常（它们不走信箱），**只有鼠标移动彻底不动**，
+                //   而日志里"鼠标包发送率"照样 100Hz+（那个数统计的是"造帧"，不是"发帧"）。
+                // 定时唤醒后，上面两种情形最多各自多滞后 0.2s，且早晚会自己好。
+                _ = s0.mouseMailboxSignal.wait(timeout: .now() + Self.mouseSenderIdlePoll)
                 // 一次唤醒把信箱取干：取的永远是"当下最新"的那一帧，
                 // 中间被顶掉的帧不会发出去（这正是省 CPU 的地方）。
                 while let s = self, s.mouseSenderGeneration == gen,
                       let p = s.mouseMailbox.takeLatest() {
                     if case .failure(let e) = s.connection.send(p) {
                         s.handleSendFailure(e)
+                        // 失败时信箱里可能还压着更新的一帧：补一次信号。
+                        // （即使漏了，上面的定时唤醒也会兜住；这里只是把延迟压到最小。）
+                        if s.mouseMailbox.isPending { s.mouseMailboxSignal.signal() }
                         break               // 链路有问题时别再闷头发，交给看门狗
                     }
                     s.sendFailStreak = 0
+                    s.mouseDeliveredAt = Date()
                     s.reportMouseMailboxIfNeeded()
                 }
             }
@@ -171,6 +206,123 @@ public final class MWBClient {
         mouseMailboxReportedCoalesced = c
         log("[MWB] 鼠标移动包合流：\(mouseMailbox.summary)"
             + " —— 发送线程只顾得上发最新的，过期位置直接丢掉（不阻塞事件 tap）")
+    }
+
+    // MARK: - 鼠标发送线程自愈（supervisor）
+
+    /// 兜底自愈：发送线程若已经"停摆"（信箱压着位置却久久一帧都没交付）就重起一条。
+    ///
+    /// 这是**覆盖面最广**的一道保险：无论线程是被谁、以什么方式停掉的
+    /// （断链、重连、未来的新退出路径，甚至将来有人误删了某处的重启调用），
+    /// 只要鼠标还压着帧没发出去，1 秒内就会自愈并留下一条日志。
+    /// 由 `startMouseSenderSupervisor()` 的 1s 定时器周期调用。
+    /// 判据本体抽在 `MouseSenderSupervisor`（纯逻辑，可离线自检）。
+    func checkMouseSenderHealth(now: Date = Date()) {
+        let deliveredAgo = now.timeIntervalSince(mouseDeliveredAt)
+        let handledAgo = now.timeIntervalSince(mouseStallHandledAt)
+        guard MouseSenderSupervisor.shouldRestart(isPending: mouseMailbox.isPending,
+                                                 deliveredAgo: deliveredAgo,
+                                                 linkDead: linkDead,
+                                                 handledAgo: handledAgo) else { return }
+        mouseStallHandledAt = now
+        mouseStallRestarts += 1
+        log("[MWB] ⚠️ 鼠标发送线程已停摆（信箱里压着位置，"
+            + "\(String(format: "%.1f", deliveredAgo))s 一帧都没发出去）→ 已自动重启"
+            + "（累计第 \(mouseStallRestarts) 次）。"
+            + "如果你正好遇到「键盘能用、鼠标不动 / Windows 上看不到光标」，就是它救的场")
+        startMouseMoveSender()
+    }
+
+    /// 发送线程是否活着（线程对象存在且未结束）。用于日志与自检。
+    var mouseSenderAlive: Bool {
+        guard let t = mouseSenderThread else { return false }
+        return !t.isFinished && !t.isCancelled
+    }
+
+    // MARK: - 鼠标发送线程的哨兵定时器
+
+    private var mouseSupervisor: DispatchSourceTimer?
+    /// 上次汇报时信箱的累计计数（用来算"这一轮投递/实发各多少"）。
+    private var mouseStatSubmitted = 0
+    private var mouseStatSent = 0
+
+    /// 每 1 秒看一眼"该不该重启鼠标发送线程"。
+    ///
+    /// 放在主队列：重启线程、打日志都按主线程语义走，跟其它链路事件一致。
+    /// 1s/次的代价可以忽略，换来的是**任何原因**导致的发送线程停摆都能在 1 秒内自愈。
+    private func startMouseSenderSupervisor() {
+        mouseSupervisor?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(200))
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            guard self.input.isControllingRemote else {
+                // 控制权在本机时，信箱里压着的旧位置属于正常残留（没人该发它）——
+                // 顺手丢掉，免得下一轮控制刚开始就先把一帧陈坐标甩给对端。
+                self.mouseMailbox.discardPending()
+                return
+            }
+            self.checkMouseSenderHealth()
+        }
+        t.resume()
+        mouseSupervisor = t
+    }
+
+    /// 故障注入：只为验证"哨兵自愈"这条兜底真的会上膛，正常使用不会触发。
+    ///
+    /// `MWB_SIMULATE_MOUSE_SENDER_STALL=<秒数>`（默认 3）→ 到点用 `stopMouseMoveSender()`
+    /// **原样复现「断链重连之后」的那个状态**（线程代号作废、线程退出），随后每 0.5s 往信箱投一帧
+    /// （模拟用户还在动鼠标），持续 20 次。
+    /// 预期日志（这是自检判据）：
+    ///   ① `[故障注入] 已停线程（线程存活=false）`
+    ///   ② 1~2s 内 `⚠️ 鼠标发送线程已停摆 … → 已自动重启`（**哨兵在干活**）
+    ///   ③ 之后那条 `鼠标包发送率 … ｜ 信箱投递 N 实发 M` 里 `实发 ≥ 1`（帧真的被取走发出去了）
+    ///
+    /// 【为什么要重复投帧】哨兵只在"控制远端"时才判停摆（控制权在本机时信箱里的残留帧属于正常，
+    /// 会被主动丢掉）。配合 `MWB_CURSOR_SELFTEST=send`（它会把状态置成"正在控制对端"）才能命中。
+    private func startFaultInjectionIfRequested() {
+        guard let raw = ProcessInfo.processInfo.environment["MWB_SIMULATE_MOUSE_SENDER_STALL"],
+              !raw.isEmpty else { return }
+        let delay = Double(raw) ?? 3.0
+        log("[MWB] [故障注入] \(delay)s 后将停掉鼠标发送线程（模拟断链重连后的状态），验证哨兵自愈")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.stopMouseMoveSender()
+            self.log("[MWB] [故障注入] 已停线程（线程存活=\(self.mouseSenderAlive)）；"
+                     + "接下来每 0.5s 投一帧，应在 1~2s 内看到哨兵重启并把这些帧发出去")
+            self.injectMouseFrames(remaining: 20)
+        }
+    }
+
+    private func injectMouseFrames(remaining: Int) {
+        guard remaining > 0 else { return }
+        var p = DataPacket(type: .mouse)
+        p.mouseFlags = InputController.mouseMoveFlag
+        p.mouseX = 32767
+        p.mouseY = 32767
+        if !mouseMailbox.submit(p) { mouseMailboxSignal.signal() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.injectMouseFrames(remaining: remaining - 1)
+        }
+    }
+
+    /// 故障注入之二：**伪造一次链路死亡**，走的是完全真实的那条路径
+    /// （`handleLinkDead` → 交回控制权 → 退避重连 → 重连成功 → 重启鼠标发送线程）。
+    ///
+    /// `MWB_SIMULATE_LINK_DEAD=<秒数>` → 到点调 `handleLinkDead("故障注入…")`。
+    /// 这是**主修复**（"重连后没人重启发送线程"）的直接验证，预期日志：
+    ///   ① `✗ 故障注入：伪造链路死亡 → 立即把控制权交回 Mac，并开始自动重连…`
+    ///   ② `[重连] 第 1 次尝试将在 0.5s 后开始` → `[连接] 开始重连 …`
+    ///   ③ **`[重连] ✓ 链路已恢复（鼠标发送线程已重启）`** ← 判据就是这一行里的括号
+    ///   ④ 之后的 `鼠标包发送率 … ｜ 信箱投递 N 实发 M` 里 `实发` 继续增长
+    /// 对端在线时约 6s 走完；对端不在线时会一直在退避重连（日志会刷 ✗ 失败，属预期）。
+    private func startReconnectFaultInjectionIfRequested() {
+        guard let raw = ProcessInfo.processInfo.environment["MWB_SIMULATE_LINK_DEAD"],
+              let delay = Double(raw) else { return }
+        log("[MWB] [故障注入] \(delay)s 后将伪造一次链路死亡（走真实的重连与恢复路径）")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.handleLinkDead("故障注入：伪造链路死亡")
+        }
     }
 
     /// 统一处理发送失败：限流打日志 + 连续失败到阈值就判定链路死亡。
@@ -252,7 +404,16 @@ public final class MWBClient {
                         self.sendFailLogCount = 0
                         self.reconnectAttempts = 0
                         self.announceHello()
-                        self.log("[MWB] [重连] ✓ 链路已恢复，键鼠可以继续跨屏")
+                        // ★★ 必须重新起一条鼠标发送线程。
+                        //
+                        // 【为什么】`handleLinkDead` 会 `stopMouseMoveSender()`（把旧线程的代号作废，
+                        // 它随即退出），而重连成功只重启了**接收**循环 —— 没有人重启发送线程。
+                        // 于是重连之后：键盘/点击/滚轮照常（它们不走信箱、直接同步 send），
+                        // **鼠标移动却永远发不出去**（帧全被压在信箱里轮着被顶掉），
+                        // 在 Windows 侧的表现就是「屏幕上连光标都不显示」。
+                        // 这正是 2026-09-19 用户报的那个 bug，且只在"断过一次线"之后出现。
+                        self.startMouseMoveSender()
+                        self.log("[MWB] [重连] ✓ 链路已恢复（鼠标发送线程已重启），键鼠可以继续跨屏")
                         self.onLinkUp?()
                     case .failure(let e):
                         self.log("[MWB] [重连] ✗ 失败: \(e)")
@@ -461,6 +622,11 @@ public final class MWBClient {
         // 鼠标移动包改由**独立线程**异步发送（信箱只留最新一帧）——
         // 必须在 run() 末尾起：此时连接、密钥、socket 都已就绪。
         startMouseMoveSender()
+        // 哨兵：万一发送线程以任何方式停摆（断链、重连、将来新加的退出路径…），
+        // 1 秒内自动重启它。没有这道保险时，故障形态是"键盘能用、鼠标完全不动"。
+        startMouseSenderSupervisor()
+        startFaultInjectionIfRequested()
+        startReconnectFaultInjectionIfRequested()
         return .success(())
     }
 
@@ -993,6 +1159,22 @@ public final class MWBClient {
                 : " 位移映射=按对端像素1:1 远端分辨率=\(Int(input.remoteScreenSize.width))x\(Int(input.remoteScreenSize.height))"))
         log("[MWB] 撞到该边缘即接管 Windows；反向推回来或按 Control+Option+Esc 收回本机")
 
+        // 「鼠标包发送率」日志里追加**真实投递**统计（造帧 vs 实发 vs 积压 vs 线程存活）。
+        // 这一段是 2026-09-19 那个 bug 的直接产物：当时日志只看得到造帧数（100Hz+），
+        // 完全看不出"一帧都没发出去"，排查绕了很大一圈。
+        input.mouseDeliveryProbe = { [weak self] in
+            guard let self else { return "" }
+            let sub = self.mouseMailbox.submitted
+            let sen = self.mouseMailbox.sent
+            let dSub = sub - self.mouseStatSubmitted
+            let dSent = sen - self.mouseStatSent
+            self.mouseStatSubmitted = sub
+            self.mouseStatSent = sen
+            return " ｜ 信箱投递 \(dSub) 实发 \(dSent)"
+                 + (self.mouseMailbox.isPending ? " 积压=有(1帧)" : " 积压=无")
+                 + (self.mouseSenderAlive ? "" : " ⚠️发送线程已停")
+        }
+
         // ★★ Win → Mac 文件拖放的**收尾触发**：本机左键抬起。
         //
         // 对齐 PowerToys：`DragDropStep09(int wParam)` 挂在鼠标钩子上，判据只有
@@ -1180,6 +1362,10 @@ public final class MWBClient {
         // ① 先停鼠标发送线程：否则 ByeBye 之后还可能冒出一帧过期位置，
         //    对端会看到一个"已经道别了还在动"的机器。
         stopMouseMoveSender()
+        // 哨兵也一起停：`linkDead = true` 之后它本来就不会重启线程，
+        // 但留着一个每秒跑的空定时器没有意义（下次 run() 会重新起）。
+        mouseSupervisor?.cancel()
+        mouseSupervisor = nil
 
         permissionWatchTimer?.cancel()
         permissionWatchTimer = nil
@@ -1268,7 +1454,17 @@ public final class MWBClient {
         // 对端发来的每个包都带着它的机器 ID，顺手记下来。
         // 文件拖放要用它当定向包的目标：PowerToys 的 DragDropStep08_2 要求
         // `package.Des == 自己的 MachineID` 才认，用 0xFF 广播是无效的。
-        if p.src != 0, p.src != 0xFF, p.src != connection.myID {
+        //
+        // ⚠️ 但**握手期的 `Handshake(126)` / `Hi(2)` 不能信**：它们的 `Src` 是**随机模板值**
+        //    （本次日志实证：同一台 Windows 连续三次握手给出 0xace667cc / 0xad52e65e / 0xddcf05a7，
+        //     三个都不一样；真 MachineID 只在 `HandshakeAck.Src` 里，= 0x307e878d）。
+        //    早先这里"见包就学"，于是每次重连后 `peerID` 都会被学成垃圾值 ——
+        //    而它是**定向包的唯一目标**（`ClipboardDragDropOperation(75)` 与
+        //    `handedControlToRemote()` 发的 `MachineSwitched(77)` 都要求 `Des == 对端真 ID`，
+        //    广播 0xFF 无效，见 §7.19 身份三项）⇒ 重连后的一段时间里拖放 / >1MB 剪贴板会**静默失效**，
+        //    直到下一次心跳把 peerID 纠正过来。心跳与绝大多数包带的都是真 ID，所以这个坑一直被掩盖。
+        let srcIsTrustworthy = p.type != .handshake && p.type != .hi
+        if srcIsTrustworthy, p.src != 0, p.src != 0xFF, p.src != connection.myID {
             if peerID != p.src {
                 peerID = p.src
                 log("[MWB] 学到对端 MachineID = 0x\(String(p.src, radix: 16)) (\(p.src))，来自 \(p.type)")

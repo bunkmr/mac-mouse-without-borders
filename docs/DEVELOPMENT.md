@@ -287,8 +287,8 @@ macOS 捕获/注入全局输入需要：
 7. ⚠️ **CLI 单测的 `<machineName>` 必须和 GUI 注册的名字逐字节相同**。
    门控里 `ResolveID(name)` 是在**对端机器池**里按名字查 ID，名字对不上就查不到 → 直接拒。
    GUI 用的是 `SCDynamicStoreCopyLocalHostName`（即 `scutil --get LocalHostName`），
-   在**本机就是 `MacBook-Pro-2`**（不是 `scutil --get ComputerName` 的 `MacBook Pro`，
-   也不是 `hostname` 的 `MacBook-Pro-2.local`）。
+   在**本机就是 `MacBook-Pro`**（不是 `scutil --get ComputerName` 的 `MacBook Pro`，
+   也不是 `hostname` 的 `MacBook-Pro.local`）。
    拿错名字的现象和「主通道没在线」**一模一样**（都是 `EPIPE errno=32`），排查时先核对这一点。
 
    本机可用的完整实测参数：
