@@ -27,6 +27,10 @@ private enum K {
     static let mouseMap = "mouseButtonBindings"
     static let scrollRevTo = "scrollReverseToRemote"
     static let scrollRevFrom = "scrollReverseFromRemote"
+    /// 跨屏待机唤醒：屏幕熄灭后是否阻止「系统空闲睡眠」（默认关，别偷偷改耗电习惯）
+    static let standbyWake = "standbyWakeEnabled"
+    /// 待机唤醒是否只在插电时生效（默认开：电池时照常深度睡眠）
+    static let standbyWakeACOnly = "standbyWakeACOnly"
 }
 
 // ⚠️ 老版本这里有个 `MouseChordOption`（把「后退 / 前进」两个侧键映射成 10 个固定组合键）。
@@ -56,6 +60,27 @@ final class AppState: ObservableObject {
     @Published var slotText: String { didSet { UD.set(slotText, forKey: K.slot) } }
     /// 控制 Windows 期间把本机光标钉在屏幕边缘（实测唯一有效的锁定方式）。
     @Published var lockCursorWhileRemote: Bool { didSet { UD.set(lockCursorWhileRemote, forKey: K.lockCursor) } }
+
+    /// 跨屏待机唤醒（v1.4.3）：屏幕熄了也不让**系统**进入空闲睡眠 ——
+    /// 屏幕照常熄灭省电，但 MWB 进程还活着、心跳还在发、包还收得到，
+    /// 于是 Windows 鼠标撞过来时能立刻点亮屏幕并接管。机制见 `StandbyGuard.swift`。
+    @Published var standbyWakeEnabled: Bool {
+        didSet {
+            UD.set(standbyWakeEnabled, forKey: K.standbyWake)
+            applyStandbySettings()
+        }
+    }
+    /// 只在插电时生效（电池供电时照常深度睡眠，不偷偷掉续航）。
+    @Published var standbyWakeACOnly: Bool {
+        didSet {
+            UD.set(standbyWakeACOnly, forKey: K.standbyWakeACOnly)
+            applyStandbySettings()
+        }
+    }
+    /// 界面上那行状态字（由 2s 健康轮询维护，**值变了才发布**）。
+    @Published var standbyStatusText = "已关闭"
+    /// 远端唤醒累计次数（同上，值变才发布）。
+    @Published var standbyWakeCount = 0
 
     // MARK: - 剪贴板 / 快捷键映射（高级设置）
 
@@ -125,8 +150,20 @@ final class AppState: ObservableObject {
 
     private var client: MWBClient?
     private var pollTimer: Timer?
+    /// 连接请求代号：每次 `connect()` 自增，异步回调里比对，迟到的回调不许覆盖新实例。
+    /// （2026-09-22：连点「连接」会留下**僵尸客户端** —— 旧的没停、新的又起，两套重连
+    ///   循环同时轰对端，把 Windows 端 MWB 打进自我保护 `too many connections` 自杀。）
+    private var connectGeneration = 0
 
     init() {
+        // ★★ 第一件事：忽略 SIGPIPE。
+        //   【2026-09-23 事故】上一轮把 I/O 从 CFStream 换成裸 fd 后，丢掉了 CFStream 内建的
+        //   `SO_NOSIGPIPE` 保护。于是「链路刚断、socket 已被对端 RST，而发送线程还在写」
+        //   的窗口里，内核抛出的 SIGPIPE 会**直接终止进程**——不可捕获、写不出任何日志、
+        //   不产生崩溃报告，App 就那样毫无征兆地消失了。实测一天被杀 3 次。
+        //   放在 init() 里 = 早于任何 socket 建立、早于任何连接逻辑。
+        MWBConnection.installSIGPIPEIgnore()
+
         // 首次运行给一组可直接用的默认值，之后一律读回上次的设置
         func localName() -> String {
             if let ln = SCDynamicStoreCopyLocalHostName(nil) as String?, !ln.isEmpty { return ln }
@@ -159,6 +196,11 @@ final class AppState: ObservableObject {
         self.slotText = UD.string(forKey: K.slot) ?? "auto"
         self.lockCursorWhileRemote = UD.object(forKey: K.lockCursor) == nil
             ? true : UD.bool(forKey: K.lockCursor)
+        // 跨屏待机唤醒：默认**关**（保持历史行为）。开启代价是"插电时系统不再空闲睡眠"，
+        // 所以这件事必须由用户自己点头，且默认只在插电时生效。
+        self.standbyWakeEnabled = UD.bool(forKey: K.standbyWake)
+        self.standbyWakeACOnly = UD.object(forKey: K.standbyWakeACOnly) == nil
+            ? true : UD.bool(forKey: K.standbyWakeACOnly)
 
         // 图片剪贴板默认开（与 MWB 原生一致）
         self.clipboardImageEnabled = UD.object(forKey: K.clipImage) == nil
@@ -183,6 +225,14 @@ final class AppState: ObservableObject {
 
         // 把上面这些下发到运行时（属性观察器在 init 里不触发，必须显式来一遍）
         applyRuntimeSettings()
+        // 待机唤醒也要在这里先同步一次：它决定状态行文案，而状态行在**未连接**时
+        // 同样要说得对 —— 否则会出现"两个开关都勾着、状态却写「已关闭」"的自相矛盾。
+        applyStandbySettings()
+        // 再取一次文案作为初值：`standbyStatusText` 靠 2s 健康轮询维护，
+        // 而离屏渲染 / 刚启动的那一两秒轮询还没跑，界面就会显示硬编码的初值
+        // （2026-09-19 离屏渲染截图实测：开关勾着、状态写"已关闭"）。
+        standbyStatusText = StandbyGuard.shared.statusText
+        standbyWakeCount = StandbyGuard.shared.wakeCount
     }
 
     /// 把「高级设置」里的剪贴板/快捷键映射下发到 InputController 与 ClipboardSync。
@@ -369,10 +419,26 @@ final class AppState: ObservableObject {
             statusText = "请先填写 Windows 主机 IP 与安全密钥"
             return
         }
+        // 已在连接中就别再来一次：`run()` 里是秒级的阻塞 I/O，期间用户连点按钮
+        // 会造出多个 MWBClient（各自带一条连接 + 一个重连看门狗 + 一条鼠标发送线程），
+        // 一起轰对端 —— 2026-09-22 的事故就是这么触发的。
+        guard !connecting else { return }
         axTrusted = AXIsProcessTrusted()
         connecting = true
         statusText = "连接中…"
         clearLog()
+
+        // ★ 建新实例前先把旧实例收掉。`MWBClient.run()` 一起就是"常驻"的：
+        //   连接 + 重连看门狗 + 鼠标发送线程 + 电源断言持有者，只建不停就是**僵尸客户端**，
+        //   它会一直按退避去连对端。旧实现只在成功时 `self.client = c`，失败那次连引用都不留。
+        connectGeneration += 1
+        let generation = connectGeneration
+        client?.stop()
+        client?.connection.close()
+        client = nil
+        pollTimer?.invalidate(); pollTimer = nil
+        connected = false
+        controllingRemote = false
 
         // 注意：所有配置要在 run() 之前设好 —— run() 内部会据此建立连接
         applyRuntimeSettings()
@@ -389,6 +455,9 @@ final class AppState: ObservableObject {
         c.preferredMotionScale = proportionalMapping ? .proportional : .pixelExact
         // 控制远端时把本机光标钉在屏幕边缘
         c.preferredLockCursor = lockCursorWhileRemote
+        // 跨屏待机唤醒：屏幕熄了也不让系统睡死，等 Windows 的键鼠过来点亮
+        c.preferredStandbyWake = standbyWakeEnabled
+        c.preferredStandbyWakeACOnly = standbyWakeACOnly
         if let w = Double(remoteW), let h = Double(remoteH), w > 0, h > 0 {
             c.preferredRemoteSize = CGSize(width: w, height: h)
         }
@@ -446,19 +515,32 @@ final class AppState: ObservableObject {
             self?.appendLog("[GUI] 开始连接 \(port) …")
             let result = c.run()
             DispatchQueue.main.async {
-                self?.connecting = false
+                guard let self else { return }
+                // 代际守卫：这次连接已被更新的请求取代 —— 收掉它，绝不留僵尸实例
+                //（它自带重连看门狗，会在后台一直轰对端，而界面上什么都看不到）。
+                guard self.connectGeneration == generation else {
+                    c.stop()
+                    c.connection.close()
+                    self.appendLog("[GUI] 上一次连接请求已被取代，已收掉（防僵尸实例）")
+                    return
+                }
+                self.connecting = false
                 switch result {
                 case .success:
-                    self?.client = c
-                    self?.connected = true
-                    self?.startHealthPolling()
-                    self?.matrix = c.matrix.snapshot()
-                    self?.statusText = "已连接 \(self?.peerName ?? "")"
-                    self?.appendLog("[GUI] 连接成功")
+                    self.client = c
+                    self.connected = true
+                    self.startHealthPolling()
+                    self.matrix = c.matrix.snapshot()
+                    self.statusText = "已连接 \(self.peerName)"
+                    self.appendLog("[GUI] 连接成功")
                 case .failure(let e):
-                    self?.connected = false
-                    self?.statusText = "连接失败: \(e)"
-                    self?.appendLog("[GUI] 连接失败: \(e)")
+                    // 失败也要显式收：`run()` 已经配过输入端、电源断言持有者等资源。
+                    c.stop()
+                    c.connection.close()
+                    self.client = nil
+                    self.connected = false
+                    self.statusText = "连接失败: \(e)"
+                    self.appendLog("[GUI] 连接失败: \(e)")
                 }
             }
         }
@@ -466,11 +548,15 @@ final class AppState: ObservableObject {
 
     func disconnect() {
         pollTimer?.invalidate(); pollTimer = nil
+        // 作废在飞的连接请求：否则它跑完 run() 后会把 client 又装回来
+        //（用户点了「断开」，界面却自己连上，且多留一个实例）。
+        connectGeneration += 1
         // 断开前必须恢复光标联动，否则解耦状态下光标会推不动
         client?.stop()
         client?.connection.close()
         client = nil
         connected = false
+        connecting = false
         controllingRemote = false
         tapEvents = 0
         keyEvents = 0
@@ -501,7 +587,18 @@ final class AppState: ObservableObject {
         DispatchQueue.main.async {
             self.pollTimer?.invalidate()
             self.pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-                guard let self, let c = self.client else { return }
+                guard let self else { return }
+                // ── 待机唤醒状态：与"是否已连接"无关（由开关 + 是否持有断言决定），
+                //    所以刻意放在 client 守卫**之前** —— 否则未连接时界面会一直显示初始值。
+                //    ★ 依旧遵守「值变才发」：`@Published` 一写整个面板就重算一次，
+                //      这条纪律是 2026-09-17 那次 CPU 飙高的直接教训。
+                //    （Timer 装在主 RunLoop 上，回调即主线程，可直接写。）
+                let st = StandbyGuard.shared.statusText
+                if self.standbyStatusText != st { self.standbyStatusText = st }
+                let wc = StandbyGuard.shared.wakeCount
+                if self.standbyWakeCount != wc { self.standbyWakeCount = wc }
+
+                guard let c = self.client else { return }
                 let h = c.input.captureHealth()
                 let snap = c.matrix.snapshot()
                 let listening = CGPreflightListenEventAccess()
@@ -513,6 +610,28 @@ final class AppState: ObservableObject {
                 }
             }
         }
+    }
+
+    /// 待机唤醒开关一变就立刻下达（不必等重连）。
+    ///
+    /// ⚠️ 共享守护那一步**必须放在 client 守卫之前**：状态行文案由它决定，
+    /// 而"未连接"时同样要说得对 —— 否则界面会出现「开关勾着、状态写已关闭」的自相矛盾
+    /// （2026-09-19 离屏渲染截图实测到）。
+    func applyStandbySettings() {
+        StandbyGuard.shared.configure(enabled: standbyWakeEnabled, acOnly: standbyWakeACOnly)
+        guard let c = client else { return }
+        c.preferredStandbyWake = standbyWakeEnabled
+        c.preferredStandbyWakeACOnly = standbyWakeACOnly
+    }
+
+    /// 待机唤醒的**交互式自检**（不需要 Windows）：3 秒后熄屏、再过 3 秒点亮。
+    /// 用独立实例跑，所以未连接也能验证"这条链路真能把屏幕点回来"。
+    func runStandbyWakeSelfTest() {
+        appendLog("[GUI] 待机唤醒自检：3 秒后熄屏 → 再 3 秒点亮。**全程请勿触碰键鼠**"
+                  + "（你一动，系统就当作真实用户活动，屏幕会提前亮，自检结论就不作数了）")
+        let g = StandbyGuard()
+        g.log = { [weak self] s in self?.appendLog(s) }
+        g.runInteractiveSelfTest()
     }
 
     /// 用户勾完权限后不必重启 App —— 直接重建事件捕获即可。

@@ -77,6 +77,18 @@ public final class MWBClient {
     /// 协议里机器 ID 就是 1..4 的物理槽位序号，不是随机 GUID。填对槽位能让
     /// Windows 面板里的布局和我们对齐；不填也能正常工作（保持历史行为）。
     public var preferredSlot: UInt32? = nil
+    /// 跨屏待机唤醒（v1.4.3）：持有防睡眠断言 + 远端键鼠到达时点亮屏幕。
+    /// 机制与「为什么不能靠协议唤醒」见 `StandbyGuard.swift` 顶部长注释。
+    ///
+    /// ⚠️ 指向**进程共享单例**，不是每个 Client 各持一个：App 启动时连接流程会起两个
+    /// Client（2026-09-19 实测），各持一个 Guard 就会创建两条断言、泄漏一条。
+    public var standby: StandbyGuard { StandbyGuard.shared }
+    /// 「屏幕熄灭后仍可被 Windows 键鼠唤醒」总开关。
+    /// nil 时回落到 MWB_STANDBY_WAKE 环境变量（=1 开启），再回落到 **false**（保持历史行为）。
+    public var preferredStandbyWake: Bool? = nil
+    /// 待机唤醒是否**只在插电时**生效（电池供电时照常深度睡眠）。
+    /// nil 时回落到 MWB_STANDBY_AC_ONLY（=0 = 电池也生效），再回落到 **true**。
+    public var preferredStandbyWakeACOnly: Bool? = nil
     /// 日志回调。设了就走回调，不再 print（GUI 用）
     public var onLog: ((String) -> Void)?
     /// 事件捕获是否真正可用（false = 缺辅助功能/输入监控授权，键鼠无法跨屏）
@@ -382,12 +394,67 @@ public final class MWBClient {
     /// 退避重连：0.5s → 1s → 2s → 4s → 8s（封顶）。
     /// 重连本身是阻塞 I/O（最长连超时 5s + 握手 8s），必须丢到后台线程，
     /// 否则会把主线程的事件处理和 UI 一起卡住。
+    /// 重连退避时长（秒）。**抽成纯函数是为了能被自检盯住** —— 这条曲线直接决定
+    /// 「对端整夜离线时会不会被我们轰死」，属于必须可回归的东西。
+    ///
+    /// 曲线：0.5 / 1 / 2 / 4 / 8（前 5 次，对端重启通常几十秒内回来，重试要快）
+    ///       → 8（6~10 次）→ 30（11~30 次）→ 60（31 次起）。
+    public static func reconnectBackoffDelay(attempt: Int) -> Double {
+        let n = max(1, attempt)
+        switch n {
+        case 1...5: return 0.5 * pow(2.0, Double(n - 1))   // 0.5, 1, 2, 4, 8
+        case 6...10: return 8.0
+        case 11...30: return 30.0
+        default: return 60.0
+        }
+    }
+
+    /// 重连退避回归自检 —— 判据是「**对端离线时每小时会重试多少次**」。
+    ///
+    /// 回归对象 = 2026-09-22 事故：Windows 关机 9 小时，退避一直封顶在 8s（每次连接还要
+    /// 5s 超时），合计轰了 2400+ 次；对方一开机，还没加载完安全码的 MWB 就被这波连接洪水
+    /// 打入自我保护（`too many connections`）**自行退出**。曲线一改，这里就必须跟着过。
+    public static func reconnectBackoffSelfTest() -> Bool {
+        var bad = 0
+        func expect(_ attempt: Int, _ want: Double) {
+            let got = reconnectBackoffDelay(attempt: attempt)
+            if abs(got - want) > 0.001 {
+                print("  ✗ 第 \(attempt) 次: \(got)s，期望 \(want)s"); bad += 1
+            }
+        }
+        expect(1, 0.5); expect(2, 1); expect(3, 2); expect(4, 4); expect(5, 8)
+        expect(6, 8); expect(10, 8); expect(11, 30); expect(30, 30); expect(31, 60); expect(9999, 60)
+
+        // 量化：按本条曲线跑满 9 小时要重试多少次（+5s ≈ 一次连接超时）。
+        var t = 0.0, n = 1, newCount = 0
+        while t < 32400 { t += reconnectBackoffDelay(attempt: n) + 5; newCount += 1; n += 1 }
+        let oldCount = Int(32400 / 13.5)          // 旧曲线 ≈ 8s 退避 + 5s 超时
+        print("  ✓ 曲线 0.5/1/2/4/8 → 8 → 30 → 60s；对端离线 9 小时：新 \(newCount) 次 vs 旧 \(oldCount) 次")
+        if newCount > 700 {
+            print("  ✗ 9 小时仍要重试 \(newCount) 次，过多（判据 <700）"); bad += 1
+        }
+        return bad == 0
+    }
+
     private func scheduleReconnect() {
         guard !reconnectScheduled else { return }
         reconnectScheduled = true
         reconnectAttempts += 1
-        let delay = min(0.5 * pow(2.0, Double(min(reconnectAttempts - 1, 4))), 8.0)
+        // 退避：0.5 → 1 → 2 → 4 → 8s（前 5 次）；6~10 次 8s，11~30 次 30s，31 次起 60s。
+        //
+        // 【为什么必须把间隔放长】2026-09-22 事故：Windows 关机期间我们每 ~13.5s 重连一次，
+        // 连续 9 小时轰了 2400+ 次；对方一开机，MWB 还没把安全码加载完就被这波连接洪水打进，
+        // 连续判 invalidkey，最终触发它自己的保护 `too many connections` **直接退出** ——
+        // 用户看到的就是「Windows 上 MWB 弹框自己关了 + Helper 报错，Mac 再也连不上」。
+        // 也就是说：连接本身没成本，但**对端 MWB 会记连接数**，慢下来反而是能连上的前提。
+        let delay = Self.reconnectBackoffDelay(attempt: reconnectAttempts)
         log("[MWB] [重连] 第 \(reconnectAttempts) 次尝试将在 \(String(format: "%.1f", delay))s 后开始")
+        // 长时间连不上时给一条可操作的提示（别让用户对着刷屏日志毫无头绪）。
+        if reconnectAttempts == 20 || reconnectAttempts == 100 || reconnectAttempts % 500 == 0 {
+            log("[MWB] [重连] ⓘ 已连续重试 \(reconnectAttempts) 次仍未连上。若 Windows 已开机："
+                + "① 确认托盘里有 Mouse Without Borders 且在运行（它有自我保护，可能已自行退出）；"
+                + "② 核对两边安全码一致。本机将继续以 60s 间隔重试，不会放弃。")
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             guard self.linkDead else { self.reconnectScheduled = false; return }
@@ -533,7 +600,11 @@ public final class MWBClient {
         disarmConnectWatchdog()
         log("[MWB] 握手阶段结束，进入运行态")
 
-        connection.onPacket = { [weak self] p in self?.handle(p) }
+        // ⚠️ 别强捕获 `connection`：它是 self 的属性，而它自己又持有这个闭包 → 循环引用。
+        connection.onPacket = { [weak self] p in
+            guard let self else { return }
+            self.handle(p, from: self.connection)
+        }
         // 读侧断开信号：**比等写失败快得多**（心跳 4s 一颗，而写失败要等下一次发送）。
         // 收到就立刻走同一条降级路径：交回控制权 + 自动重连。
         connection.onDisconnected = { [weak self] reason in
@@ -1096,7 +1167,12 @@ public final class MWBClient {
         let target = (peerID == 0 || peerID == 0xFF) ? 0xFF : peerID
         var p = DataPacket(type: .machineSwitched, src: connection.myID, des: target)
         p.machineName = connection.machineName
-        log("[MWB] [剪贴板] 控制权交给 Windows → 补发 MachineSwitched(77)"
+        // 把目标 ID 一并打出来：这是**定向包**，`Des` 必须是学到的对端 MachineID，
+        // 广播 0xFF 对端不认（§7.19 身份三项）。排查"交给控制权后对端没反应"时，
+        // 第一眼就该看这里的 des 是 0xFF 还是真实 ID。
+        let targetDesc = (target == 0xFF) ? "0xFF(广播)"
+                                          : "0x" + String(target, radix: 16)
+        log("[MWB] [剪贴板] 控制权交给 Windows → 补发 MachineSwitched(77) des=\(targetDesc)"
             + (lastBigClipboardBeatAt != nil ? "（本机有刚复制的大载荷，等它回连 15100 拉）" : ""))
         if case .failure(let e) = connection.send(p) { handleSendFailure(e) }
     }
@@ -1106,7 +1182,11 @@ public final class MWBClient {
         lis.onLog = { [weak self] s in self?.log("[MWB] \(s)") }
         lis.onPeerConnected = { [weak self] conn in
             conn.onLog = { [weak self] s in self?.log("[MWB] \(s)") }
-            conn.onPacket = { [weak self] p in self?.handle(p) }
+            // ⚠️ 必须 weak conn：conn 自己持有这个闭包，强捕获就是循环引用。
+            conn.onPacket = { [weak self, weak conn] p in
+                guard let self, let conn else { return }
+                self.handle(p, from: conn)
+            }
             conn.startReceiveLoop()
         }
         if lis.start(sharedMachineID: machineID) {
@@ -1144,6 +1224,21 @@ public final class MWBClient {
         } else if env["MWB_LOCK_CURSOR"] == "0" {
             input.lockCursorWhileRemote = false
         }
+        // 跨屏待机唤醒：显式属性 > 环境变量 > 默认关（保持历史行为，别悄悄改用户的耗电习惯）。
+        // 开启后：持有「阻止系统空闲睡眠」断言（屏幕照常熄灭省电）+ 远端键鼠包到达时点亮屏幕。
+        let standbyOn = preferredStandbyWake ?? (env["MWB_STANDBY_WAKE"] == "1")
+        let standbyACOnly = preferredStandbyWakeACOnly ?? (env["MWB_STANDBY_AC_ONLY"] != "0")
+        standby.log = { [weak self] s in self?.log(s) }
+        standby.configure(enabled: standbyOn, acOnly: standbyACOnly)
+        // 登记本 Client 为"活跃持有者"：断言只在**至少有一个连接在线**时才持有 ——
+        // 全部断开后要还系统一个正常的睡眠策略。
+        standby.setActive(true, from: self)
+        log("[MWB] 待机唤醒=\(standbyOn ? "开" : "关")"
+            + (standbyOn ? "（\(standbyACOnly ? "仅插电时生效" : "电池也生效")）"
+                          + " —— 屏幕熄灭后系统不进入空闲睡眠，Windows 鼠标晃过来即刻点亮"
+                          + "；注意：手动睡眠 / 合盖 仍是真挂起，那只能靠有线 WoL"
+                         : " —— 屏幕熄灭一段时间后系统会正常深度睡眠（此状态下收不到任何网络包）"))
+
         // 每帧重申「光标解耦」：默认开。MWB_ASSOC_PERFRAME=0 可关掉，仅供对照实验。
         // （关掉是 2026-09-14 那次"锁不住"回归的成因，正常使用别动它。）
         if env["MWB_ASSOC_PERFRAME"] == "0" {
@@ -1367,6 +1462,11 @@ public final class MWBClient {
         mouseSupervisor?.cancel()
         mouseSupervisor = nil
 
+        // 注销本 Client：**全部**连接都下线后守护才会撤下断言（把正常睡眠策略还给系统）。
+        // 这里刻意不调 `standby.stop()` —— 启动时可能还有另一个 Client 在线，
+        // 无条件 stop 会把它的断言一起撤掉（2026-09-19 实测到两个 Client 并存）。
+        standby.setActive(false, from: self)
+
         permissionWatchTimer?.cancel()
         permissionWatchTimer = nil
         dropWatchdog?.cancel()
@@ -1390,7 +1490,13 @@ public final class MWBClient {
         linkDead = true
         reconnectScheduled = false
 
-        // ③ 立刻关掉 socket：让对端马上看到 FIN，而不是等它的超时。
+        // ③ 停止接受回连，并把已经收下的回连一起关掉。
+        //    不这么做的话：用户断开后 Windows 还会回连进来，挂在一条"已停用客户端"上
+        //    （对象被监听器持有 → fd 不回收），而 Windows 那边会以为会话还在。
+        listener?.stop()
+        listener = nil
+
+        // ④ 立刻关掉 socket：让对端马上看到 FIN，而不是等它的超时。
         connection.close()
         matrix.markPeersOffline()
         input.releaseCursor()
@@ -1446,7 +1552,10 @@ public final class MWBClient {
         inboundLastReportAt = now
     }
 
-    private func handle(_ p: DataPacket) {
+    /// `conn` = 收到这个包的那条连接。同一个 `MWBClient` 可能同时有两条活跃连接
+    /// （出站主连 + Windows 回连进来的那条），剪贴板分片缓冲必须**按连接隔离**，
+    /// 否则两条连接的分片会交错，且并发写同一数组会堆破坏（见 `ClipboardSync.batches`）。
+    private func handle(_ p: DataPacket, from conn: MWBConnection) {
         noteInbound()      // 链路探针：用 MWB 自己的 TCP 流的到达节奏量链路抖动
         if verbose {
             log("[MWB] ← type=\(p.type) id=\(p.id) src=\(p.src) des=\(p.des) name='\(p.machineName)'")
@@ -1534,6 +1643,10 @@ public final class MWBClient {
             break
 
         case PackageType.mouse.rawValue:
+            // 跨屏待机唤醒：屏幕若已熄灭，这一包就是"把屏幕叫醒"的信号。
+            // 放在所有分支之前 —— 即便是投放态收尾包 / 被"我方在控制远端"守卫丢弃的包，
+            // 都足以说明"对面有人在动鼠标"，该把屏幕点亮（见 StandbyGuard）。
+            standby.noteRemoteActivity()
             // 【诊断】投放态中把对端发来的「非位移」鼠标包记下来 —— 这是判断
             // 「Windows 到底有没有把松手那一拍发过来」的唯一直接证据。
             // 实测（2026-09-14）：物理鼠标在 Mac 上，抬起是**本地事件**，
@@ -1582,20 +1695,22 @@ public final class MWBClient {
             }
 
         case PackageType.keyboard.rawValue:
+            // 键盘包同样算"远端有人在操作" —— 屏幕上没接麦克风/鼠标也能被键盘叫醒。
+            standby.noteRemoteActivity()
             input.injectKeyboard(vk: p.keyVk, flags: p.keyFlags)
 
         case PackageType.clipboardText.rawValue:
             // 远端剪贴板文本分片（每片 48 字节，铺在 byte16..63）
-            clipboard.appendRemoteChunk(p.raw48, isImage: false)
+            clipboard.appendRemoteChunk(p.raw48, isImage: false, source: conn)
 
         case PackageType.clipboardImage.rawValue:
             // 远端剪贴板图片分片：同样是 byte16..63 铺 48 字节，但载荷是 **PNG 原始字节**，
             // 不能拿去当文本解压 —— 用 isImage 标记分开累积，到 ClipboardDataEnd 再走图片分支。
-            clipboard.appendRemoteChunk(p.raw48, isImage: true)
+            clipboard.appendRemoteChunk(p.raw48, isImage: true, source: conn)
 
         case PackageType.clipboardDataEnd.rawValue:
             // 结束标记 —— 到这一刻才按批次类型整体处理（图片解码 / 文本解压拆包）
-            clipboard.finishRemote()
+            clipboard.finishRemote(source: conn)
 
         case PackageType.clipboard.rawValue:
             // ★ Clipboard(69) 是「剪贴板心跳包」：对端有**大块**剪贴板数据（>1MB 的图片/文本，

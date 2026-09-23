@@ -18,7 +18,12 @@ let package = Package(
         .target(name: "MWBMacClientCore",
                 dependencies: ["CZlibShim"],
                 path: "Sources/MWBMacClientCore",
-                swiftSettings: [.swiftLanguageMode(.v5)]),
+                // ⚠️ SwiftPM 要求 swiftSettings 必须排在 linkerSettings **之前**，
+                //    写反了报 "argument 'swiftSettings' must precede argument 'linkerSettings'"。
+                swiftSettings: [.swiftLanguageMode(.v5)],
+                // IOKit 供 StandbyGuard 用：IOPMAssertion* 防睡眠断言 + IOPS 供电探测
+                // （`import IOKit.pwr_mgt` / `IOKit.ps`，须显式链接框架才稳）。
+                linkerSettings: [.linkedFramework("IOKit")]),
         .executableTarget(name: "mwbmac",
                           dependencies: ["MWBMacClientCore"],
                           path: "Sources/mwbmac",

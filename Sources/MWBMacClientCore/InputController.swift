@@ -1575,25 +1575,140 @@ public final class InputController {
     /// 打上标记后，在 handleTap 里原样放行，不参与任何本地逻辑。
     static let injectedTag: Int64 = 0x4D57_4231   // "MWB1"
 
+    /// 保护**远端注入**路径上的共享状态：`injectedButtonDown` 与 `currentModifierFlags`。
+    ///
+    /// ★ 为什么需要（2026-09-14 20:49 的崩溃，v1.3 报告）：
+    ///   `MWBClient.handle()` 会从**两条连接**的接收线程**同时**进入 —— 我们自己连出去的
+    ///   15101 主通道，以及对端顺着回连监听进来的那条（详见 `ClipboardSync.batches` 注释）。
+    ///   而 `injectedButtonDown` 是裸的 `Set<UInt32>`，并发 `insert` 会在
+    ///   `Set._Variant.insert` 里踩坏内部存储 → `SIGSEGV`。该崩溃报告栈逐帧为：
+    ///   `Set._Variant.insert` ← `InputController.injectMouseButton` ← `MWBClient.handle`，
+    ///   且崩溃瞬间**同样有两个 `MWBReceive` 线程** —— 与剪贴板那次是同一类根因。
+    ///   （`currentModifierFlags` 是 OptionSet(UInt64)，并发改不会崩，但会**丢更新**
+    ///     ⇒ 修饰键状态错乱，表现为「Shift 偶尔粘住 / 大写丢失」，一并纳入本锁。）
+    /// 开销：鼠标包是 200Hz 热路径，`NSLock` 无竞争时约 20ns 量级，可忽略。
+    private let remoteInjectLock = NSLock()
+
     /// 本机注入时当前按下的鼠标键（CGMouseButton.rawValue）。
     /// 决定注入位移该发 mouseMoved 还是 *MouseDragged —— macOS 只有在拖拽事件类型下
     /// 才会把位移当成「按住拖动」，否则接收方只当是移动光标，框选/拖窗口无效。
+    /// ⚠️ 只能在本类内、且**持 `remoteInjectLock`** 时读写。
     private var injectedButtonDown: Set<UInt32> = []
+
+    // MARK: 远端注入共享状态的**唯一入口**
+    //
+    // 三个公共注入方法都只经这三个小函数碰共享状态 —— 好处是并发自检可以直接压这里，
+    // 不需要真的 `post` CGEvent（那会去动用户真实的鼠标/键盘，没法在自检里跑）。
+    // 新增需要共享状态的地方，也请一并收进这几个入口。
+
+    private func noteInjectedButton(_ buttonNum: UInt32, isDown: Bool) {
+        remoteInjectLock.lock()
+        defer { remoteInjectLock.unlock() }
+        if isDown { injectedButtonDown.insert(buttonNum) }
+        else { injectedButtonDown.remove(buttonNum) }
+    }
+
+    /// 依据当前按下的鼠标键，决定注入位移该用哪种事件类型。
+    private func draggedEventType() -> CGEventType {
+        remoteInjectLock.lock()
+        defer { remoteInjectLock.unlock() }
+        // 注意别把整个 Set 拷出来判：200Hz 热路径上每次拷贝都是一次堆分配。
+        if injectedButtonDown.contains(CGMouseButton.left.rawValue) { return .leftMouseDragged }
+        if injectedButtonDown.contains(CGMouseButton.right.rawValue) { return .rightMouseDragged }
+        if injectedButtonDown.contains(CGMouseButton.center.rawValue)
+            || injectedButtonDown.contains(3) || injectedButtonDown.contains(4) {
+            return .otherMouseDragged
+        }
+        return .mouseMoved
+    }
+
+    /// 更新修饰键状态并返回**同一临界区内**的快照（避免"更新了却读到旧掩码"）。
+    private func noteModifierAndSnapshot(_ vk: Int32, keyDown: Bool) -> CGEventFlags {
+        remoteInjectLock.lock()
+        defer { remoteInjectLock.unlock() }
+        if let mask = Self.modifierMask[vk] {
+            if keyDown { currentModifierFlags.insert(mask) }
+            else { currentModifierFlags.remove(mask) }
+        }
+        return currentModifierFlags
+    }
+
+    /// 并发自检：**远端注入共享状态**。
+    ///
+    /// 回归对象 = 2026-09-14 20:49 的 `SIGSEGV`：崩溃报告栈为
+    /// `Set._Variant.insert` ← `InputController.injectMouseButton` ← `MWBClient.handle`，
+    /// 且崩溃瞬间**有两个 `MWBReceive` 线程** —— 与 2026-09-19 剪贴板那次是同一类根因
+    /// （单例/共享状态被两条连接的接收线程并发修改）。
+    ///
+    /// 只压三个加锁入口，**不 post 任何 CGEvent**（否则会去动用户真实的鼠标/键盘）。
+    /// 判据：① 进程存活 ② 每线程"按下再抬起"自己那个键后，集合必须回到**空**
+    /// ③ 修饰键同理归零。
+    ///
+    /// 为什么 ② 成立：所有操作被锁串行化后，**每个线程对该键的最后一次操作都是"抬起"**，
+    /// 故全局最后一次操作也必是抬起 ⇒ 集合必空。无锁时要么在 `Set` 内部崩，
+    /// 要么留下残留（丢更新）。
+    public static func injectRaceSelfTest(threads: Int = 8, rounds: Int = 20_000) -> Bool {
+        let ctl = InputController()
+        let shiftVK: Int32 = 0x10                    // VK_SHIFT（见 `modifierMask`）
+        let failLock = NSLock()
+        var failures: [String] = []
+        func fail(_ s: String) { failLock.lock(); failures.append(s); failLock.unlock() }
+
+        var typeHits: [String: Int] = [:]
+        let typeLock = NSLock()
+
+        let group = DispatchGroup()
+        for t in 0..<threads {
+            DispatchQueue.global().async(group: group) {
+                // 线程数可能多于键数 ⇒ 会有多个线程共用同一个键，
+                // 这正好也覆盖"同一键被两条连接同时按"的真实情形。
+                let btn = UInt32(t % 5)
+                var local: [String: Int] = [:]
+                for _ in 0..<rounds {
+                    ctl.noteInjectedButton(btn, isDown: true)
+                    let ty = ctl.draggedEventType()   // 与写并发地读
+                    local["\(ty.rawValue)", default: 0] += 1
+                    ctl.noteInjectedButton(btn, isDown: false)
+                    _ = ctl.noteModifierAndSnapshot(shiftVK, keyDown: true)
+                    _ = ctl.noteModifierAndSnapshot(shiftVK, keyDown: false)
+                }
+                typeLock.lock()
+                for (k, v) in local { typeHits[k, default: 0] += v }
+                typeLock.unlock()
+            }
+        }
+        group.wait()
+
+        // 判据 ②③：终态必须干净
+        ctl.remoteInjectLock.lock()
+        let leftoverButtons = ctl.injectedButtonDown
+        let leftoverMods = ctl.currentModifierFlags
+        ctl.remoteInjectLock.unlock()
+
+        if !leftoverButtons.isEmpty {
+            fail("鼠标键集合未归零：残留 \(leftoverButtons.sorted())")
+        }
+        if !leftoverMods.isEmpty {
+            fail("修饰键未归零：残留 rawValue=\(leftoverMods.rawValue)")
+        }
+
+        let totalOps = threads * rounds
+        if failures.isEmpty {
+            print("  ✓ 远端注入共享状态：\(threads) 线程 × \(rounds) 轮（共 \(totalOps) 次"
+                  + "按下/抬起 + 修饰键切换）并发读写 —— 无崩溃、终态归零")
+            print("    （并发读到的拖动事件类型分布：\(typeHits.sorted { $0.key < $1.key })）")
+        } else {
+            for f in failures { print("  ✗ \(f)") }
+        }
+        return failures.isEmpty
+    }
 
     /// 注入鼠标移动。X/Y 为 MWB 归一化坐标 0..65535（左上原点）。
     public func injectMouseMove(nx: Int32, ny: Int32) {
         let pos = mapNormalizedToScreen(nx: nx, ny: ny)
-        let type: CGEventType
-        if injectedButtonDown.contains(CGMouseButton.left.rawValue) {
-            type = .leftMouseDragged
-        } else if injectedButtonDown.contains(CGMouseButton.right.rawValue) {
-            type = .rightMouseDragged
-        } else if injectedButtonDown.contains(CGMouseButton.center.rawValue)
-                    || injectedButtonDown.contains(3) || injectedButtonDown.contains(4) {
-            type = .otherMouseDragged
-        } else {
-            type = .mouseMoved
-        }
+        // 读按键状态必须走加锁入口（见 `remoteInjectLock` 注释）；
+        // CGEvent 的构造与投递留在锁外 —— 那是系统调用，别占着锁做。
+        let type = draggedEventType()
         if let ev = CGEvent(mouseEventSource: nil, mouseType: type,
                             mouseCursorPosition: pos, mouseButton: .left) {
             ev.setIntegerValueField(.eventSourceUserData, value: Self.injectedTag)
@@ -1634,14 +1749,12 @@ public final class InputController {
             ev.post(tap: CGEventTapLocation.cghidEventTap)
         }
         // 记录注入侧的按键状态，供 injectMouseMove 决定发 mouseMoved 还是 *MouseDragged。
+        // 走加锁入口：两条接收线程会同时进来，裸 `Set.insert` 会踩坏内部存储
+        // （2026-09-14 的 SIGSEGV 就在这里，见 `remoteInjectLock` 注释）。
         let isDown = (flags == WM_LBUTTONDOWN || flags == WM_RBUTTONDOWN
                       || flags == WM_MBUTTONDOWN || flags == WM_XBUTTONDOWN)
         let buttonNum: UInt32 = isXButton ? UInt32(xMacNumber) : button.rawValue
-        if isDown {
-            injectedButtonDown.insert(buttonNum)
-        } else {
-            injectedButtonDown.remove(buttonNum)
-        }
+        noteInjectedButton(buttonNum, isDown: isDown)
     }
 
     /// 注入鼠标滚轮。delta 为 Windows 滚轮值（带方向）。
@@ -1931,16 +2044,12 @@ public final class InputController {
 
         // 维护当前修饰键状态：Shift/Control/Alt/Command 自身按下/抬起时更新标志位，
         // 这样后续普通键（如 Shift+A）注入时才会带上正确掩码，得到大写/组合效果。
-        if let mask = Self.modifierMask[vk] {
-            if keyDown {
-                currentModifierFlags.insert(mask)
-            } else {
-                currentModifierFlags.remove(mask)
-            }
-        }
+        // 走加锁入口：`CGEventFlags` 是 OptionSet(UInt64)，并发改虽不崩但会**丢更新**，
+        // 表现为「Shift 偶尔粘住 / 大写丢失」；快照与更新在同一临界区内取。
+        let flagsSnapshot = noteModifierAndSnapshot(vk, keyDown: keyDown)
 
         guard let ev = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: keyDown) else { return }
-        ev.flags = currentModifierFlags
+        ev.flags = flagsSnapshot
         ev.setIntegerValueField(.eventSourceUserData, value: Self.injectedTag)
         ev.post(tap: CGEventTapLocation.cghidEventTap)
     }

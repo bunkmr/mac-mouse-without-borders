@@ -14,6 +14,10 @@ setvbuf(stdout, nil, Int32(_IONBF), 0)
 
 let args = CommandLine.arguments
 
+// ★ 最早期就把 SIGPIPE 兜底装上（2026-09-23 事故：默认处置会让进程在断链重连时无声消失）。
+//   Connection 内部建 socket 时还会再调一次（幂等），这里只是把窗口前移到"任何 I/O 之前"。
+MWBConnection.installSIGPIPEIgnore()
+
 // MARK: - 剪贴板打包串离线自测
 //
 // 用法: mwbmac --clip-bundle-selftest
@@ -176,6 +180,76 @@ if args.count > 1 && args[1] == "--mouse-sender-supervisor-selftest" {
     exit(fails.isEmpty ? 0 : 2)
 }
 
+if args.count > 1 && args[1] == "--input-inject-race-selftest" {
+    // 回归 2026-09-14 的 SIGSEGV：两条接收线程并发改 InputController 的远端注入状态
+    // （栈 = Set._Variant.insert ← injectMouseButton ← MWBClient.handle）。
+    print("远端注入共享状态并发自检（回归「Set 并发修改崩溃」）")
+    let ok = InputController.injectRaceSelfTest()
+    print("\n结果: \(ok ? "通过" : "失败")")
+    exit(ok ? 0 : 2)
+}
+
+if args.count > 1 && args[1] == "--clip-race-selftest" {
+    // 回归 2026-09-19 的 SIGABRT：多连接并发收剪贴板分片 → 共享缓冲堆破坏（free_medium_botch）。
+    print("剪贴板分片并发自检（回归「Windows 截图后 App 退出」）")
+    let ok = ClipboardSync.raceSelfTest()
+    print("\n结果: \(ok ? "通过" : "失败")")
+    exit(ok ? 0 : 2)
+}
+
+if args.count > 1 && args[1] == "--reconnect-backoff-selftest" {
+    // 回归 2026-09-22「对端刚开机就被我们轰死」：退避曾长期封顶 8s 且永不放弃，
+    // 对端离线 9 小时就轰 2400+ 次 —— 对方 MWB 一启动就被连接洪水打进
+    // `too many connections` 自我保护、自行退出（Windows 上弹框、Helper 报错）。
+    print("重连退避曲线自检（回归「Windows 端 MWB 被连接洪水打进自我保护」）")
+    let ok = MWBClient.reconnectBackoffSelfTest()
+    print("\n结果: \(ok ? "通过" : "失败")")
+    exit(ok ? 0 : 2)
+}
+
+if args.count > 1 && args[1] == "--sigpipe-selftest" {
+    // 回归 2026-09-23「App 静默消失」：裸 fd I/O 改造丢掉了 CFStream 内建的
+    // SO_NOSIGPIPE 保护 ⇒ 断链窗口里往已 RST 的 socket 写会抛 SIGPIPE，
+    // 而 SIGPIPE 默认动作 = 直接终止进程（不可捕获、无日志、无崩溃报告）。
+    // 实测一天被杀 3 次（16:06:42 / 17:01:07 / 18:04:14）。
+    let ok = MWBConnection.sigpipeSelfTest()
+    exit(ok ? 0 : 2)
+}
+
+if args.count > 1 && args[1] == "--sigpipe-selftest-raw" {
+    // 阳性对照：恢复 SIGPIPE 默认处置后做同一个写操作 —— 必须被信号杀掉（退出码 141）。
+    // 若这里打印出任何文字并正常退出，说明自检在空跑。
+    exit(MWBConnection.sigpipeNegativeControl())
+}
+
+if args.count > 1 && args[1] == "--listener-retention-selftest" {
+    // 回归 2026-09-23「回连风暴」：MWBListener 接受回连后**没人持有** MWBConnection，
+    // 握手成功的一瞬间对象就析构 → deinit 关 fd → 对端 RST →
+    // Windows 的 REOPEN_WHEN_WSAECONNRESET 立刻重连 → 每秒 3 次、永不停止。
+    print("回连持有自检（回归「监听器不持有回连 → 对端 RST → 重连风暴」）")
+    let ok = MWBListener.retentionSelfTest()
+    print("\n结果: \(ok ? "通过" : "失败")")
+    exit(ok ? 0 : 2)
+}
+
+if args.count > 1 && args[1] == "--conn-reconnect-reset-selftest" {
+    // 回归 2026-09-20「假连接」：出站重连复用同一个 MWBConnection 对象，
+    // 却不清 handshakeDone ⇒ doHandshake() 不等对端 HandshakeAck 就宣布成功
+    // ⇒ Windows 睡醒后 Mac 连上一条对端不处理的连接（日志全绿、UI 显示"已连接"，但鼠标没反应）。
+    print("重连会话状态重置自检（回归「Win 睡眠唤醒后鼠标推过去无光标」）")
+    let ok = MWBConnection.reconnectResetSelfTest()
+    print("\n结果: \(ok ? "通过" : "失败")")
+    exit(ok ? 0 : 2)
+}
+
+if args.count > 1 && args[1] == "--standby-guard-selftest" {
+    let (pass, total, fails) = StandbyGuard.selfTest()
+    print("跨屏待机唤醒判据自测（当前供电：\(StandbyGuard.isOnACDescription())）")
+    for f in fails { print("  ✗ \(f)") }
+    print("\n结果: \(pass)/\(total) 通过")
+    exit(fails.isEmpty ? 0 : 2)
+}
+
 if args.count > 1 && args[1] == "--mouse-map-selftest" {
     let (pass, total, fails) = MouseBindingStore.selfTest()
     print("鼠标按键映射自测")
@@ -294,7 +368,12 @@ func serveFakePeer(peerFD: Int32, key: String, name: String, fakeID: UInt32, mag
     let outCtx = CBCContext(key: k, iv: MWBCrypto.legacyIV())
     let inCtx  = CBCContext(key: k, iv: MWBCrypto.legacyIV())
 
+    // ⚠️ 必须串行：CBC 链里每段密文都参与下一段，而下面的"投喂鼠标"线程会与主循环
+    //    并发发包 —— 不加锁两条链会互相踩坏（对端直接解密失败，表现为"连上但什么都不通"）。
+    let sendLock = NSLock()
     func sendPacket(_ p: DataPacket) -> Bool {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         var buf = p.serialize()
         MWBCrypto.stampPacket(&buf, magic: magic)
         guard case .success(let ct) = outCtx.encrypt(buf) else { return false }
@@ -311,6 +390,32 @@ func serveFakePeer(peerFD: Int32, key: String, name: String, fakeID: UInt32, mag
     hello.machineName = name
     guard sendPacket(hello) else { return }
     print("[伪对端] 已发首个包（magic=0x\(String(magic, radix: 16))），等对端握手…")
+
+    // ③ 可选：定时投喂 Mouse(123) 包 —— 这是**端到端验证「跨屏待机唤醒」的唯一办法**
+    //    （真机上"从 Windows 把鼠标晃过来"没法脚本化）。
+    //    用法：MWB_FAKE_MOUSE_EVERY=3  → 连接建立后每 3 秒发一个鼠标移动包。
+    //    预期（App 侧）：屏幕若已熄灭，日志出现
+    //    「☀️ 屏幕已熄灭，收到远端键鼠包 → 已声明用户活动点亮屏幕」，且屏幕真的亮起来。
+    if let every = Double(ProcessInfo.processInfo.environment["MWB_FAKE_MOUSE_EVERY"] ?? ""),
+       every > 0 {
+        print("[伪对端] 已开启鼠标包投喂：每 \(every)s 一个 Mouse(123)")
+        fflush(stdout)
+        let t = Thread {
+            var i = 0
+            while true {
+                Thread.sleep(forTimeInterval: every)
+                i += 1
+                var m = DataPacket(type: .mouse, src: fakeID, des: 0)
+                m.mouseFlags = InputController.mouseMoveFlag
+                m.mouseX = 32767          // 归一化坐标中点：对端只关心"有人动了鼠标"
+                m.mouseY = 32767
+                if sendPacket(m) { print("[伪对端] → 已投喂第 \(i) 个 Mouse(123)") }
+                fflush(stdout)
+            }
+        }
+        t.name = "FakePeerMouseFeed"
+        t.start()
+    }
 
     var ackCount = 0
     while true {

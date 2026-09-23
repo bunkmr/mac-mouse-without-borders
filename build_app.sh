@@ -159,7 +159,11 @@ echo "▶ 安装到 /Applications…"
 # 一个 .app 很容易被顶到 50 个条目以上，于是 rm -rf 被「批量删除保护」拦下
 # （SAFE_DELETE_BULK_CONFIRM_REQUIRED），set -e 让脚本中断、App 直接缺失。
 # mv 是**同卷 rename**，不是删除，不会触发该保护；旧包进废纸篓还能找回。
-pkill -x MWBMacClientApp 2>/dev/null || true
+# 【为什么按「完整路径」收，而不是 pkill -x MWBMacClientApp】
+# 按进程名全杀会连**用户正在用的、从别的路径启动的**实例一起收掉（2026-09-19 误伤过一次：
+# 排查时用 `pkill -x MWBMacClientApp` 清理自检实例，把用户从 /Applications 起的正式实例也杀了）。
+# 这里其实只想停掉**即将被替换的这个 /Applications 实例**。
+pkill -f "/Applications/$APPNAME.app/Contents/MacOS/" 2>/dev/null || true
 sleep 0.8
 # 先清掉命令行工具留下的临时文件，别让它们被算进签名封印
 find "$APP" \( -name '.BC.T_*' -o -name '._*' -o -name '.DS_Store' -o -name '*.cstemp*' \) -delete 2>/dev/null || true

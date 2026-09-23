@@ -184,6 +184,9 @@ public final class MWBClipboardChannel {
         }
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        // ★ 2026-09-23：裸 fd 必须自带 SIGPIPE 豁免，否则往已消失的对端写会**杀掉整个 App**
+        //   （见 MWBConnection.sigpipeIgnored 的事故说明：一天被杀 3 次）。
+        MWBConnection.noSIGPIPE(fd: fd)
 
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -226,6 +229,7 @@ public final class MWBClipboardChannel {
             var len = socklen_t(MemoryLayout<sockaddr>.size)
             let peerFD = Darwin.accept(listenFD, &remote, &len)
             if peerFD < 0 { continue }
+            MWBConnection.noSIGPIPE(fd: peerFD)   // ★ 回连进来的对端 socket 同样要豁免 SIGPIPE
             Thread { [weak self] in
                 guard let self else { Darwin.close(peerFD); return }
                 self.handleInbound(fd: peerFD)
@@ -796,6 +800,9 @@ public final class MWBClipboardChannel {
             if fd >= 0 {
                 var tv = timeval(tv_sec: 6, tv_usec: 0)
                 setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+                // ★ ★ 这里是剪贴板通道**最可能被杀**的地方：拉大剪贴板（照片）时链路一断，
+                //   这个 fd 就成了死 socket，`writeAll` 再写一次就是 SIGPIPE。
+                MWBConnection.noSIGPIPE(fd: fd)
                 if connect(fd, p.pointee.ai_addr, p.pointee.ai_addrlen) == 0 { return fd }
                 Darwin.close(fd)
             }

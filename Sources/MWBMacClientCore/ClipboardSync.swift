@@ -69,10 +69,42 @@ public final class ClipboardSync {
     private var lastSentImageDigest: Int?
     private var pollTimer: DispatchSourceTimer?
 
-    /// 远端分片的累积缓冲（文本与图片共用一条，用 `pendingIsImage` 区分批次）。
-    private var pending: [UInt8] = []
-    private var pendingIsImage = false
-    private var pendingFrom: Date?
+    /// 一条连接的远端分片累积缓冲（文本与图片共用，用 `isImage` 区分批次）。
+    private struct PendingBatch {
+        var bytes: [UInt8] = []
+        var isImage = false
+        var from: Date?
+        /// **弱**引用该批次的归属连接。
+        ///
+        /// ★ 为什么需要它（本键是 `ObjectIdentifier`，即对象内存地址）：
+        ///   连接对象销毁后，它的地址**很可能被下一条连接复用**（同为 `MWBConnection`
+        ///   这一 size class，malloc 会原地再分配）。若不加校验，新连接的第一片会被
+        ///   `append` 到**上一任留下的残字节**后面 ⇒ 粘贴出来是乱码（不崩，但更难查）。
+        ///   而"残字节被留下"恰恰发生在最容易踩到的场景：**传输中途断链**
+        ///   （截图几百 KB 正传着、WiFi 一抖就断），下一次重连很可能复用同一地址。
+        ///   有了 owner，只要"归属者 ≠ 当前连接"（含已析构 ⇒ nil）就直接丢弃重来。
+        weak var owner: AnyObject?
+    }
+
+    /// 远端分片的累积缓冲 —— **每条连接各一份**，键是连接对象的身份。
+    ///
+    /// ★ 为什么不能全进程共用一份（2026-09-19 崩溃根因，`SIGABRT` / `free_medium_botch`）：
+    ///   同一个 `MWBClient` 会同时持有**两条**活跃连接 —— 我们自己连过去的 15101 主通道，
+    ///   以及 Windows 顺着 `startReturnListener()` 回连进来的那条。两条各有独立的
+    ///   `MWBReceive` 线程，却都调 `handle()` ⇒ 写同一个单例的同一个数组。
+    ///   两个线程并发 `append` 时 `Array` 的 COW 会误判 buffer 唯一性，一边扩容释放旧 buffer、
+    ///   另一边还在写 → 堆破坏 → `malloc_zone_error: free_medium_botch` → `abort()`。
+    ///   平时剪贴板文本量小、竞争窗口极小；而 **Windows 截图是几百 KB ÷ 48B/片 = 几千片连发**，
+    ///   窗口被放大几千倍，于是"一截图就退出"。v1.4（09:27 那次）与本版崩溃栈逐帧一致 ⇒ 老 bug 非回归。
+    ///   注意：**即使加了锁，两条连接的分片混进同一份缓冲也会交错成乱码**，所以必须按连接隔离。
+    private var batches: [ObjectIdentifier: PendingBatch] = [:]
+    /// 保护 `batches` —— 多条接收线程 + 主队列轮询都会碰。
+    private let lock = NSLock()
+
+    /// 在锁内原地读写某条连接的批次（`subscript(key:default:)` 的 `_modify` 是原地访问，不额外拷贝）。
+    private func withBatch<T>(_ key: ObjectIdentifier, _ body: (inout PendingBatch) -> T) -> T {
+        body(&batches[key, default: PendingBatch()])
+    }
 
     private func log(_ s: String) { onLog?(s) }
 
@@ -217,36 +249,55 @@ public final class ClipboardSync {
 
     /// 累积一个远端剪贴板分片（ClipboardText(124) 或 ClipboardImage(125) 的 byte16..63）。
     ///
+    /// `source` = 收到这个包的那条连接（直接把 `MWBConnection` 实例传进来）。**必须传**：
+    /// 两条连接的缓冲彼此隔离，否则既会交错成乱码、并发写同一数组还会堆破坏（见 `batches` 注释）。
     /// 一批数据必须同类型 —— 中途换类型说明上一批丢了 End，直接丢弃重来。
-    public func appendRemoteChunk(_ bytes: [UInt8], isImage: Bool = false) {
-        let stale = pendingFrom.map { Date().timeIntervalSince($0) > 5 } ?? true
-        if stale || (!pending.isEmpty && pendingIsImage != isImage) {
-            pending.removeAll(keepingCapacity: true)
+    public func appendRemoteChunk(_ bytes: [UInt8], isImage: Bool = false,
+                                  source: AnyObject) {
+        let key = ObjectIdentifier(source)
+        let now = Date()
+        lock.lock()
+        defer { lock.unlock() }
+        withBatch(key) { b in
+            // ★ 先验归属：owner 已析构（nil）或已换人 ⇒ 这份是上一任的残骸，丢弃重来。
+            //   （地址复用防护，详见 `PendingBatch.owner` 注释）
+            if b.owner !== source {
+                b.bytes.removeAll(keepingCapacity: true)
+                b.from = nil
+            }
+            b.owner = source
+            let stale = b.from.map { now.timeIntervalSince($0) > 5 } ?? true
+            if stale || (!b.bytes.isEmpty && b.isImage != isImage) {
+                b.bytes.removeAll(keepingCapacity: true)
+            }
+            b.isImage = isImage
+            b.from = now
+            b.bytes.append(contentsOf: bytes)
+            // 防御：万一对方一直不发 End，别让内存无限增长
+            let cap = isImage ? Self.imageLimit : Self.instantLimit
+            if b.bytes.count > cap {
+                b.bytes.removeAll(keepingCapacity: true)
+                b.from = nil
+            }
         }
-        pendingIsImage = isImage
-        pendingFrom = Date()
-        pending.append(contentsOf: bytes)
-        // 防御：万一对方一直不发 End，别让内存无限增长
-        let cap = isImage ? Self.imageLimit : Self.instantLimit
-        if pending.count > cap { pending.removeAll(keepingCapacity: true); pendingFrom = nil }
     }
 
     /// 收到 ClipboardDataEnd(76)：按批次类型整体处理（图片直接解码，文本解压 + 拆包）。
     /// 返回写入的纯文本（图片或失败返回 nil）。
     @discardableResult
-    public func finishRemote() -> String? {
-        let data = pending
-        let isImage = pendingIsImage
-        pending.removeAll(keepingCapacity: true)
-        pendingFrom = nil
-        pendingIsImage = false
-        guard !data.isEmpty else { return nil }
-
-        if isImage {
-            _ = acceptRemoteImage(Data(data))
+    public func finishRemote(source: AnyObject) -> String? {
+        let key = ObjectIdentifier(source)
+        lock.lock()
+        let b = batches.removeValue(forKey: key)
+        lock.unlock()
+        // ★ 解码与写板一律放到锁外：会跑 DEFLATE、写 pasteboard、回调 onLog，
+        //   持锁做这些既慢又容易和别的路径互相等待。
+        guard let b, b.owner === source, !b.bytes.isEmpty else { return nil }
+        if b.isImage {
+            _ = acceptRemoteImage(Data(b.bytes))
             return nil
         }
-        return acceptRemoteWireText(data)
+        return acceptRemoteWireText(b.bytes)
     }
 
     /// 接收**线上格式的文本字节**（DEFLATE 压缩的打包串）。
@@ -290,14 +341,120 @@ public final class ClipboardSync {
         return true
     }
 
-    /// 远端批次是否正在累积中。
-    public var hasPendingRemote: Bool { !pending.isEmpty }
+    /// 是否有任一连接正在累积远端批次。
+    public var hasPendingRemote: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return batches.values.contains { !$0.bytes.isEmpty }
+    }
 
-    /// 丢弃当前远端批次（例如对端推的是我们不支持的类型）。
-    public func dropPending() {
-        pending.removeAll(keepingCapacity: true)
-        pendingFrom = nil
-        pendingIsImage = false
+    /// 丢弃正在累积的远端批次；传 `source` 只丢那一条连接的，不传则全丢
+    /// （例如对端推的是我们不支持的类型、或连接已断开）。
+    public func dropPending(source: AnyObject? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let s = source { batches.removeValue(forKey: ObjectIdentifier(s)) }
+        else { batches.removeAll(keepingCapacity: true) }
+    }
+
+    /// 诊断 / 自检用：取某条连接当前累积的字节（拷一份出来，不改内部状态）。
+    /// 归属不符（地址已被别的对象复用）时返回空 —— 与 `finishRemote` 的判定口径一致。
+    public func pendingSnapshot(source: AnyObject) -> [UInt8] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let b = batches[ObjectIdentifier(source)], b.owner === source else { return [] }
+        return b.bytes
+    }
+
+    // MARK: - 并发回归自检
+
+    /// 给 `raceSelfTest` 当"连接身份"用的占位对象。
+    private final class RaceToken {}
+
+    /// 并发压力自检：模拟**多条连接同时收剪贴板分片**。
+    ///
+    /// 回归对象 = 2026-09-19 的 `SIGABRT`（`free_medium_botch`）：两条 `MWBReceive` 线程
+    /// 并发 `append` 同一个数组，`Array` 的 COW 误判 buffer 唯一性 → 一边扩容释放旧 buffer、
+    /// 另一边还在写 → 堆破坏 → `malloc` 主动 abort。**旧实现跑这个自检会崩**，
+    /// 新实现（按连接隔离 + 加锁）必须既**不崩**、又**每条连接的数据一字不差**。
+    ///
+    /// 场景：
+    ///   ① 并发 —— 8 条连接 × 3000 片同时写：不崩 + 不串味 + 字节数精确。
+    ///   ② 地址复用 —— 上一任连接析构后新连接落在**同一地址**，残字节不得被续上。
+    ///
+    /// 判据：① 进程存活 ② 每条连接的字节数 = `chunks × 48` ③ 每片首字节 = 该连接编号。
+    public static func raceSelfTest(connections: Int = 8, chunks: Int = 3000) -> Bool {
+        var bad = 0
+
+        // ---------- 场景 ①：并发 ----------
+        let sync = ClipboardSync()          // 用局部实例，别污染 shared
+        let tokens = (0..<connections).map { _ in RaceToken() }
+
+        let group = DispatchGroup()
+        for c in 0..<connections {
+            DispatchQueue.global().async(group: group) {
+                // ★ 载荷必须**每个线程各自构造**：闭包按引用捕获外层 `payload`，
+                //   若共享同一份、再在片头写连接编号，测的就是"8 条线程互相踩同一个数组"
+                //   —— 那会假报串味（首字节被别的线程改写），也会给被测代码叠加上真实存在的
+                //   读-写竞争，把自检结果搅浑。
+                var payload = (0..<chunkSize).map { UInt8($0 % 251) }
+                payload[0] = UInt8(c)       // 每片首字节标记"是谁的片"
+                for _ in 0..<chunks {
+                    sync.appendRemoteChunk(payload, isImage: true, source: tokens[c])
+                }
+            }
+        }
+        group.wait()
+
+        for c in 0..<connections {
+            let got = sync.pendingSnapshot(source: tokens[c])
+            if got.count != chunks * chunkSize {
+                print("  ✗ 连接#\(c) 字节数 \(got.count)，期望 \(chunks * chunkSize)")
+                bad += 1
+                continue
+            }
+            var mismatch = 0
+            for k in stride(from: 0, to: got.count, by: chunkSize) where got[k] != UInt8(c) {
+                mismatch += 1
+            }
+            if mismatch > 0 {
+                print("  ✗ 连接#\(c) 有 \(mismatch)/\(chunks) 片串味（首字节不是 \(c)）")
+                bad += 1
+            }
+        }
+        if bad == 0 {
+            print("  ✓ 并发：\(connections) 条连接 × \(chunks) 片（每条 \(chunks * chunkSize / 1024)KB）"
+                  + "同时写入 —— 无崩溃、无串味、字节数精确")
+        }
+
+        // ---------- 场景 ②：地址复用防护 ----------
+        // 构造「上一任连接留下的残字节，其批次键（= 内存地址）被新连接占用」。
+        // 关键点：残批次的 `from` 必须是**新鲜的**（<5s），否则会被 stale 超时兜住，
+        // 那样测的就不是 owner 校验了 —— 必须让 owner 校验成为唯一防线。
+        let reuse = ClipboardSync()
+        let ghost = RaceToken()                 // 借它的 ObjectIdentifier 充当"已析构旧连接"
+        let live = RaceToken()                  // 占据同一键的"新连接"
+        let phantomKey = ObjectIdentifier(live)
+        reuse.lock.lock()
+        var stale = PendingBatch()
+        stale.bytes = [0xDE, 0xAD, 0xBE, 0xEF]  // 上一任传了一半就断链的残骸
+        stale.isImage = true
+        stale.from = Date()                     // 新鲜 ⇒ stale 超时不会触发
+        stale.owner = ghost
+        reuse.batches[phantomKey] = stale
+        reuse.lock.unlock()
+
+        reuse.appendRemoteChunk([0x11, 0x22], isImage: true, source: live)
+        let after = reuse.pendingSnapshot(source: live)
+        if after == [0x11, 0x22] {
+            print("  ✓ 地址复用：残批次 4 字节被丢弃，新连接从 2 字节干净起头")
+        } else {
+            print("  ✗ 地址复用：新连接拿到 \(after.count) 字节 \(after.map { String(format: "%02x", $0) })"
+                  + "，期望 2 字节 1122（残字节被续上了）")
+            bad += 1
+        }
+
+        return bad == 0
     }
 
     // MARK: - 读写本机剪贴板

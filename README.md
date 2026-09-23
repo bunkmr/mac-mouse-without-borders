@@ -38,6 +38,7 @@ Windows 上的「无界鼠标」只能让 Windows 电脑之间互联。这个程
 | 🗂️ 页签式设置面板 | 基础设置 / 文件传输 / 键盘映射 / 日志和帮助，四页签各管一块，找设置不再翻长列表 |
 | 🧭 屏幕方位可配 | 告诉它 Windows 屏幕在你 Mac 的左边 / 右边 / 上面 / 下面 |
 | 👥 最多 4 台机器 | 与 MWB 的机器矩阵一致 |
+| ☀️ 唤醒对端屏幕 | Windows 睡着时把鼠标推过去，自动点亮它的屏幕（可关，可设仅插电生效） |
 | 🖥️ 菜单栏常驻 | 没有 Dock 图标，点菜单栏图标随时改配置 |
 
 ---
@@ -62,9 +63,9 @@ Windows 上的「无界鼠标」只能让 Windows 电脑之间互联。这个程
 
 ### 第 1 步：下载
 
-👉 **前往 [Releases 页面](https://github.com/bunkmr/mac-mouse-without-borders/releases/latest) 下载 `MWB-v1.4.2-universal.dmg`**（约 2.1 MB）
+👉 **前往 [Releases 页面](https://github.com/bunkmr/mac-mouse-without-borders/releases/latest) 下载 `MWB-v1.4.3-universal.dmg`**（约 2.2 MB）
 
-也可以直接下仓库里的那份：[dist/MWB-v1.4.2-universal.dmg](dist/MWB-v1.4.2-universal.dmg)。
+也可以直接下仓库里的那份：[dist/MWB-v1.4.3-universal.dmg](dist/MWB-v1.4.3-universal.dmg)。
 
 ### 第 2 步：安装
 
@@ -146,6 +147,33 @@ xattr -dr com.apple.quarantine /Applications/MWB.app
 ---
 
 ## 更新记录
+
+### v1.4.3（2026-09-23）
+
+这一版主要是**稳定性修复** —— 把一整类「App 会莫名其妙消失 / 连不上对端」的故障清掉了，
+另外新增跨屏待机唤醒。
+
+- ✨ **新增：Windows 睡着时，鼠标推过去能把它叫醒**。以前 Windows 进入睡眠、屏幕黑掉后，
+  你把鼠标推到 Windows 那边屏幕是不会亮的，得过去动一下它的键鼠；现在鼠标一到达就点亮对端屏幕。
+  为了避免和系统电源策略打架，它**只挡「系统空闲睡眠」、不挡「显示器睡眠」**（屏幕该灭还是灭），
+  可在设置里关闭，默认可配成「仅插电时生效」。
+- 🐛 **修掉「在 Windows 上截图后，Mac 端 App 自己消失」**。根因是两条连接（我们连出去的 +
+  对端回连进来的）会在同一处累积剪贴板分片、同时写进同一个缓冲区，把内存写坏后进程被系统强制终止。
+  平时复制一两行文字撞不上；**截图是几千个分片连着发**，把这个隐患放大到必现。现在两条连接各存各的、互不干扰。
+- 🐛 **修掉「Windows 睡眠唤醒后，Mac 显示已连接、鼠标推过去却没有指针」**。
+  出站重连时没有清掉上一次会话的握手状态，导致**把收到的第一个包当成握手完成**，
+  跳过了与对端的认证确认 —— 于是状态条写着「已连接」，其实根本没接通。现在重连会真正等对端应答。
+- 🐛 **修掉「Windows 端 MWB 弹 `too many connections`、Mac 连不上」**。
+  对端关机时我们的重连太密（约每 13 秒一次，一夜能轰 2000 多次），会把对端打进自我保护状态。
+  现在退避拉长（最长 60 秒），并修掉「反复点连接会留下多个重连循环一起发请求」的问题。
+- 🐛 **修掉「App 毫无征兆地消失：日志停在半截、也查不到崩溃报告」**。
+  往一个已经被对端断开的连接里写数据时，系统会**直接杀掉进程** —— 这个终止方式拦截不了、
+  也不会产生崩溃报告，一天内曾发生 3 次。现在进程与每条连接都做了豁免：
+  写失败会正常报错并触发重连，而不是让 App 消失。
+- 🐛 一并修掉**断线时连接资源没有正确释放**，以及**对端回连进来的连接没人持有、
+  被立刻关掉、反过来逼对端每秒重连两次**的问题（Windows 端日志会因此刷屏报错）。
+- 🐛 修掉一处**鼠标 / 键盘注入状态的并发写入** —— 极端情况下可能崩溃，
+  或者让 Shift 键「粘住」（松开却仍然是大写）。
 
 ### v1.4.2（2026-09-19）
 
@@ -338,10 +366,11 @@ no extra software needed on the Windows side.
 - Clipboard text sync
 - File drag & drop in both directions (single files)
 - Configurable screen position, up to 4 machines
+- Wake the other machine's screen when the mouse is pushed over
 
 **Install**
 
-1. Download `dist/MWB-v1.4.2-universal.dmg`
+1. Download `dist/MWB-v1.4.3-universal.dmg`
 2. Drag `MWB.app` into `/Applications`
 3. The app is not notarized, so run once:
    ```bash

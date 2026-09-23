@@ -231,6 +231,57 @@ struct ContentView: View {
 
     // MARK: - ① 基础设置
 
+    /// 待机唤醒区块（v1.4.3）。
+    ///
+    /// ★ **必须**单独抽成 view、且文案放静态属性：直接内联进 `basicsTab` 的 VStack
+    ///   会让那个表达式的类型推断超时 ——
+    ///   `error: the compiler is unable to type-check this expression in reasonable time`。
+    ///   诱因是「长字符串字面量 + 多层嵌套 ViewBuilder」。2026-09-17 改版与本次
+    ///   （2026-09-19）都栽在同一处，所以这里刻意拆干净。
+    @ViewBuilder
+    private var standbyWakeSection: some View {
+        Divider()
+        SectionTitle("待机唤醒（屏幕熄灭后仍可被 Windows 键鼠唤醒）")
+        Toggle("屏幕熄灭后仍可被 Windows 鼠标唤醒", isOn: $state.standbyWakeEnabled)
+            .help(Self.standbyHelp)
+        Toggle("仅在插电时生效（电池时照常深度睡眠）", isOn: $state.standbyWakeACOnly)
+            .disabled(!state.standbyWakeEnabled)
+            .help(Self.standbyHelpAcOnly)
+        HStack(spacing: 8) {
+            Text(standbyStatusLine).font(.caption).foregroundStyle(.secondary)
+            Spacer()
+            Button {
+                state.runStandbyWakeSelfTest()
+            } label: {
+                Label("唤醒自检", systemImage: "sun.max").font(.caption)
+            }
+            .buttonStyle(.bordered).controlSize(.small)
+            .help(Self.standbyHelpTest)
+        }
+    }
+
+    private var standbyStatusLine: String {
+        guard state.standbyWakeEnabled else { return "已关闭" }
+        return state.standbyStatusText
+            + (state.standbyWakeCount > 0 ? " · 已唤醒 \(state.standbyWakeCount) 次" : "")
+    }
+
+    private static let standbyHelp = """
+    开启后：本 App 会持有一条「阻止系统空闲睡眠」断言 —— 屏幕照常熄灭省电，但系统不再进入空闲睡眠。于是 MWB 一直在线（心跳照发、包照收、Windows 面板里本机不会掉线），Windows 鼠标撞到本机边缘时就能立刻点亮屏幕并接管。
+
+    ⚠️ 它挡不住「手动睡眠」和「合盖」—— 那是真挂起：进程被冻结、socket 不再收包。这不是本 App 的限制，是 macOS 的机制（改 MWB 协议也没用）。真要「睡死还能被叫醒」，只能靠硬件级 WoL：有线网 + pmset womp + 对端发魔术包。
+    """
+
+    private static let standbyHelpAcOnly = """
+    笔记本电池供电时不阻止睡眠，避免悄悄掉续航；一旦插上电源会在 5 秒内自动生效。
+    想电池时也生效，把这个开关关掉即可（代价是电池模式下不再深度睡眠）。
+    """
+
+    private static let standbyHelpTest = """
+    不需要连接 Windows：点一下，屏幕会熄灭 3 秒后自动点亮。
+    这 6 秒内请不要碰键鼠 —— 一碰，屏幕会被真实输入提前点亮，自检结论就不作数了。
+    """
+
     private var basicsTab: some View {
         VStack(alignment: .leading, spacing: 8) {
             SectionTitle("Windows 主机")
@@ -285,6 +336,8 @@ struct ContentView: View {
                       + "验证鼠标回得来、且交回本机后不会被立刻弹回去。")
                 Spacer()
             }
+
+            standbyWakeSection
 
             Divider()
             matrixSection

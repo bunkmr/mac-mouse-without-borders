@@ -18,6 +18,28 @@ public final class MWBListener {
     private var thread: Thread?
     private var running = false
 
+    /// 已接受、且**仍然活着**的回连。
+    ///
+    /// ★★ 必须持强引用 —— 2026-09-23 回连风暴的根因就在这里"没人持有"：
+    ///   `serve()` 里的 `conn` 是局部变量，`MWBConnection.startReceiveLoop()` 又是
+    ///   `[weak self]`（线程不持有对象），于是**握手成功的一瞬间对象就析构**：
+    ///   `deinit` 关掉 fd → 对端看到 RST → Windows 的 `REOPEN_WHEN_WSAECONNRESET`
+    ///   立刻重连 → 再被 RST …… 打成每秒 3 次、永不停止的连接洪水，
+    ///   最后把对端自己的 `too many connections` 保护也打出来。
+    ///   现场铁证：旧版本 14 小时只有 **5** 次回连；出问题的版本 30 小时 **13313** 次。
+    ///   顺带这也是"同一条回连的数据没人收"的根因（接收循环根本来不及跑）。
+    private var live: [MWBConnection] = []
+    private let liveLock = NSLock()
+
+    /// 同时最多保留多少条回连。正常 MWB 只会维持 1~2 条，这只是防洪水兜底。
+    public var maxLiveConnections = 24
+
+    /// 当前还活着的回连条数（诊断用）。
+    public var liveConnectionCount: Int {
+        liveLock.lock(); defer { liveLock.unlock() }
+        return live.count
+    }
+
     /// 每条回连建立后回调（通常在这里启动接收循环）。
     public var onPeerConnected: ((MWBConnection) -> Void)?
     public var onLog: ((String) -> Void)?
@@ -106,6 +128,7 @@ public final class MWBListener {
                                  securityKey: securityKey,
                                  machineName: machineName, myID: id)
         conn.onLog = onLog
+        conn.roleLabel = "回连"
         switch conn.attach(fd: peerFD) {
         case .failure(let e):
             onLog?("[监听] 回连绑定失败: \(e)")
@@ -118,12 +141,119 @@ public final class MWBListener {
             conn.close()
         case .success:
             onLog?("[监听] 回连握手成功 ✓  \(hostStr)")
+            // ★ 顺序很重要：**先接住**再交给上层。反过来做的话，只要上层不留引用，
+            //   对象在 `serve()` 返回时就没了（见 `live` 的注释）。
+            adopt(conn)
             onPeerConnected?(conn)
         }
+    }
+
+    /// 收下一条回连：清理已死的、登记新的、必要时回收最旧的。
+    ///
+    /// 与 `serve()` 成功路径共用同一条代码路径，所以能直接拿它做回归自检。
+    func adopt(_ conn: MWBConnection) {
+        var trimmed: [MWBConnection] = []
+        liveLock.lock()
+        live.removeAll { $0.closed }          // 顺手把已经死掉的清出去
+        live.append(conn)
+        while live.count > maxLiveConnections {
+            trimmed.append(live.removeFirst())
+        }
+        let count = live.count
+        liveLock.unlock()
+
+        if !trimmed.isEmpty {
+            onLog?("[监听] 活跃回连超过 \(maxLiveConnections) 条，回收最旧的 \(trimmed.count) 条")
+        }
+        if count > 2 {
+            onLog?("[监听] 当前活跃回连 \(count) 条（正常应为 1~2 条）")
+        }
+        for old in trimmed { old.close() }   // 别在锁里做 I/O
     }
 
     public func stop() {
         running = false
         if listenFD >= 0 { Darwin.close(listenFD); listenFD = -1 }
+        liveLock.lock()
+        let all = live
+        live.removeAll()
+        liveLock.unlock()
+        for c in all { c.close() }
+    }
+
+    // MARK: - 回归自检
+
+    /// 回归对象 = 2026-09-23「回连风暴」：监听器收下回连后**没人持有**它的强引用，
+    /// 握手成功的一瞬间对象就析构 → `deinit` 关 fd → 对端 RST → 疯狂重连。
+    ///
+    /// 判据（四条，各钉住一个真实故障面）：
+    ///   ① 断开我们本地那份引用后，对象**仍然活着**（= 监听器真的接住了）；
+    ///   ② 回收上限生效（洪水时不会无限堆积 fd）；
+    ///   ③ 被回收掉的那条**已关闭且被释放**（不留僵尸 fd）；
+    ///   ④ `stop()` 之后 live 清空、且仍活着的连接都被关掉。
+    ///
+    /// 有效性由构造保证：把 `adopt` 里的 `live.append(conn)` 去掉，①必失败；
+    /// 把 `live.removeAll { $0.closed }` 与上限回收去掉，②必失败。
+    public static func retentionSelfTest() -> Bool {
+        var ok = 0, total = 0
+        let lis = MWBListener(port: 1, securityKey: "selftest", machineName: "MT")
+        lis.maxLiveConnections = 3
+
+        // ① 接得住：显式断掉本地强引用，只留监听器那一份
+        total += 1
+        weak var weakA: MWBConnection?
+        var strongA: MWBConnection? = MWBConnection(host: "127.0.0.1", port: 1,
+                                                    securityKey: "selftest", machineName: "MT")
+        weakA = strongA
+        lis.adopt(strongA!)
+        strongA = nil
+        if weakA == nil {
+            print("  ✗ 回连没被接住：强引用一断就析构（对端会看到 RST → 风暴）")
+        } else if lis.liveConnectionCount == 1 {
+            ok += 1
+            print("  ✓ 回连被接住（本地引用断开后对象仍活着）")
+        } else {
+            print("  ✗ 对象活着但没登记进 live（live=\(lis.liveConnectionCount)）")
+        }
+
+        // ② 上限回收
+        total += 1
+        var kept: [MWBConnection] = []
+        for _ in 0..<10 {
+            let c = MWBConnection(host: "127.0.0.1", port: 1,
+                                  securityKey: "selftest", machineName: "MT")
+            kept.append(c)
+            lis.adopt(c)
+        }
+        if lis.liveConnectionCount == 3 {
+            ok += 1
+            print("  ✓ 超出上限后回收最旧的（live=3，上限 3）")
+        } else {
+            print("  ✗ 上限没生效：live=\(lis.liveConnectionCount)，期望 3")
+        }
+
+        // ③ 被回收的那条已关闭 + 已释放
+        total += 1
+        if weakA == nil {
+            ok += 1
+            print("  ✓ 被回收的回连已关闭并释放（无僵尸 fd）")
+        } else {
+            print("  ✗ 被回收的回连仍被持有（僵尸 fd）")
+        }
+
+        // ④ stop() 关干净
+        total += 1
+        let inLive = Array(kept.suffix(3))
+        lis.stop()
+        let allClosed = inLive.allSatisfy { $0.closed }
+        if lis.liveConnectionCount == 0 && allClosed {
+            ok += 1
+            print("  ✓ stop() 清空并关闭了全部回连")
+        } else {
+            print("  ✗ stop() 没关干净：live=\(lis.liveConnectionCount) 都已关闭=\(allClosed)")
+        }
+
+        print("  结果: \(ok)/\(total)")
+        return ok == total
     }
 }

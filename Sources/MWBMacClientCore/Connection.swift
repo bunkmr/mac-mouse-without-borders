@@ -31,9 +31,22 @@ public final class MWBConnection {
     /// 本机机器 ID（同进程内所有连接共享同一个 ID）。
     public var myID: UInt32
 
-    private var input: InputStream?
-    private var output: OutputStream?
+    /// ★ 只用**裸 fd** 做 I/O，不再走 `CFStream`（NSStream）。
+    ///
+    /// 【为什么必须去掉 CFStream】`CFStreamCreatePairWithSocket` 会**自己再 dup 一份 fd**：
+    /// 2026-09-23 实测 `lsof` 里**同一个 socket 出现在两个 fd 上**（同一内核地址、两个 fd 号）。
+    /// 后果是"关不掉"—— 只 `Darwin.close(我们那份)` 时 TCP 连接**依然 ESTABLISHED**
+    /// （CFStream 那份还开着），于是每次 `reconnect()` 都留下一条**僵尸连接**：
+    /// 现场实测一个实例攒了 4 条到 Windows 的僵尸 ESTABLISHED 连接 + 6 个关不掉的 fd，
+    /// 对端看到"同一个 Mac 开了 4 条连接"便反复 `Closing duplicated socket`。
+    /// 换成裸 fd 后，"谁持有 fd / 什么时候真正关掉"才是确定的。
+    ///
+    /// 附带收益：`SO_RCVTIMEO` 现在真的生效了（旧注释见 `Client.armConnectWatchdog`：
+    /// 它对 NSInputStream 无效）。目前**故意不设**读超时，保持"阻塞到有数据/EOF"的语义。
     private var socketFD: Int32 = -1
+
+    /// 这条连接的角色，只用于日志与自检定位（"主动" / "回连"）。
+    public var roleLabel = "主动"
     private var encryptCtx: CBCContext?
     private var decryptCtx: CBCContext?
     private var magic: UInt16 = 0
@@ -98,21 +111,12 @@ public final class MWBConnection {
     }
 
     /// 把已 accept 的 socket fd 挂到本连接上（供回连监听器使用）。
+    ///
+    /// ⚠️ 挂上之后**调用方必须持有这个连接对象**（见 `MWBListener.adopt`）：
+    /// 对象一析构，`deinit` 就会把 fd 关掉，对端立刻看到 RST。
     public func attach(fd: Int32) -> Result<Void, MWBConnectionError> {
         socketFD = fd
         applySocketOptions(fd: fd)
-        var readStream: Unmanaged<CFReadStream>?
-        var writeStream: Unmanaged<CFWriteStream>?
-        CFStreamCreatePairWithSocket(nil, CFSocketNativeHandle(fd), &readStream, &writeStream)
-        guard let rs = readStream?.takeRetainedValue(),
-              let ws = writeStream?.takeRetainedValue() else {
-            Darwin.close(fd)
-            return .failure(.connectFailed(NSError(domain: "MWB", code: -4)))
-        }
-        self.input = rs as Stream as? InputStream
-        self.output = ws as Stream as? OutputStream
-        self.input?.open()
-        self.output?.open()
         return .success(())
     }
 
@@ -333,18 +337,6 @@ public final class MWBConnection {
         }
 
         socketFD = sock
-        var readStream: Unmanaged<CFReadStream>?
-        var writeStream: Unmanaged<CFWriteStream>?
-        CFStreamCreatePairWithSocket(nil, CFSocketNativeHandle(sock), &readStream, &writeStream)
-        guard let rs = readStream?.takeRetainedValue(),
-              let ws = writeStream?.takeRetainedValue() else {
-            Darwin.close(sock)
-            return .failure(.connectFailed(NSError(domain: "MWB", code: -4)))
-        }
-        self.input = rs as Stream as? InputStream
-        self.output = ws as Stream as? OutputStream
-        self.input?.open()
-        self.output?.open()
         return .success(())
     }
 
@@ -358,7 +350,35 @@ public final class MWBConnection {
         }
     }
 
-    /// 给 socket 设两个关键选项（主动连接与被动接受两条路径都要设）。
+    /// ★★ 2026-09-23 事故：`SIGPIPE` 会**静默杀进程**，且默认不可捕获、不留任何痕迹。
+    ///
+    /// 【现象】App 莫名其妙消失：`/tmp/mwb_gui.log` 在断链重连的半截处**突然断掉**
+    ///   （既没有 `[GUI] 收到退出信号`，也没有 `[GUI] 退出 MWB`），
+    ///   `DiagnosticReports/` 里**没有任何崩溃报告**（因为 SIGPIPE 不是崩溃，是"正常"终止）。
+    ///   唯一能查出真相的地方是系统日志：
+    ///     `launchd: exited due to SIGPIPE | sent by MWBMacClientApp[PID], ran for …`
+    ///   实测 2026-09-23 一天被杀 **3 次**：16:06:42 / 17:01:07（存活仅 10s）/ 18:04:14。
+    ///
+    /// 【根因：本工程自己引入的回归】v1.4.3 把 I/O 从 `CFStreamCreatePairWithSocket`
+    ///   换成裸 fd 后，**丢掉了 CFStream 内建的等价的 `SO_NOSIGPIPE` 保护**。
+    ///   于是「链路刚断、socket 已 RST，而发送线程还在往里写」的那个窗口里，
+    ///   内核直接给进程抛 SIGPIPE → 默认动作 = terminate ⇒ 无日志无报告地死掉。
+    ///   （写失败本该只是 `writeFailed` → 看门狗重连，却被升级成了进程级死亡。）
+    ///
+    /// 【双保险】① 进程级 `signal(SIGPIPE, SIG_IGN)`（兜底，防将来别处再踩）；
+    ///          ② 每个 socket 上 `SO_NOSIGPIPE`（精准，macOS 特有）；
+    ///   两者齐备后，往死 socket 写只会返回 `-1` + `EPIPE`，走正常失败路径。
+    ///   自检：`--sigpipe-selftest`（阳性对照 `--sigpipe-selftest-raw` 必须被 141 杀掉）。
+    private static let sigpipeIgnored: Void = {
+        signal(SIGPIPE, SIG_IGN)
+    }()
+
+    /// 幂等：确保进程级已忽略 `SIGPIPE`（任何 socket 建立前都应完成）。
+    public static func installSIGPIPEIgnore() {
+        _ = sigpipeIgnored
+    }
+
+    /// 给 socket 设三个关键选项（主动连接与被动接受两条路径都要设）。
     ///
     /// 1. **TCP_NODELAY** —— 不设的话 Nagle 会把我们每 5ms 一颗的小鼠标包攒起来
     ///    再发（还会和 delayed-ACK 互相等，最坏叠加 ~40ms）。对端收到的是
@@ -367,24 +387,78 @@ public final class MWBConnection {
     /// 2. **SO_SNDTIMEO = 2s** —— `send()` 是阻塞写且持有 sendLock；若对端不读了，
     ///    没有写超时会把主线程（事件回调）和接收线程（回显心跳）一起永久卡死。
     ///    有超时则退化成 `writeFailed`，交给 Client 的看门狗去做降级 + 重连。
+    /// 3. **SO_NOSIGPIPE** —— 关键中的关键，见上方 `sigpipeIgnored` 的整段事故说明：
+    ///    少了它，「往已被 RST 的 socket 写」不是一次普通的写失败，而是**进程静默死亡**。
     private func applySocketOptions(fd: Int32) {
+        Self.applyCoreSocketOptions(fd: fd)
+        log("[连接] socket 选项: TCP_NODELAY=on 写超时=2s 忽略SIGPIPE=on")
+    }
+
+    /// 纯 `setsockopt` 部分（独立成 `static`，好让自检能在真实 socket 上
+    /// `getsockopt` 读回来断言"真的设进去了"，而不是只断言"函数被调过"）。
+    static func applyCoreSocketOptions(fd: Int32) {
+        installSIGPIPEIgnore()               // ★ ① 进程级兜底
         var one: Int32 = 1
         _ = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
+        // ★ ② 本 socket 精准豁免：写死连接时只回 EPIPE，不再抛 SIGPIPE
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
         var tv = timeval(tv_sec: 2, tv_usec: 0)
         withUnsafePointer(to: &tv) { p in
             _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
         }
-        log("[连接] socket 选项: TCP_NODELAY=on 写超时=2s")
+    }
+
+    /// 只设 `SO_NOSIGPIPE`（+ 进程级兜底）。
+    ///
+    /// 给**自己管理超时**的裸 fd 用 —— 典型是剪贴板通道（它有独立的 6s 超时，
+    /// 不能套用主通道那套 `SO_SNDTIMEO = 2s`）。但「往死 socket 写不能杀进程」
+    /// 这条对所有 socket 一视同仁：剪贴板通道同样会往对端已经消失的 socket 写。
+    /// 见 `sigpipeIgnored` 的事故说明。
+    public static func noSIGPIPE(fd: Int32) {
+        installSIGPIPEIgnore()
+        var one: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
     }
 
     /// 断链自愈：关掉旧 socket，重新建连 + 重新握手，然后重启接收循环。
     ///
-    /// 由 `Client` 的看门狗在连续写失败时调用。`connect()` 内部已经把
-    /// `isClosed` 复位并重跑 `establishSession()`（含 magic 自校准与注册心跳），
-    /// 所以这里只需要补上「关旧的」和「重启接收线程」两步。
+    /// 由 `Client` 的看门狗在连续写失败时调用。
+    ///
+    /// ★★ **本方法复用同一个 `MWBConnection` 对象**，所以除了「关旧的 / 重开接收线程」，
+    ///    还必须把**会话级状态清干净**。`close()` 只关 socket、只置 `isClosed`，从不碰这些标记。
+    ///
+    /// 【2026-09-20 定案：不清 `handshakeDone` 会造出"假连接"】
+    ///   `handshakeDone` 只在成功匹配对端 `HandshakeAck` 时置 true，**此前没有任何地方把它
+    ///   置回 false**。于是每次出站重连，`doHandshake()` 的 3d 步会在处理完**第一个**包之后
+    ///   直接命中 `else if handshakeDone { return .success(()) }` —— **根本不等对端的 Ack**
+    ///   就宣布握手成功。日志指纹非常干净：
+    ///     · 回连（`MWBListener` 每次**新建**对象）→ 有 "[握手] 双向认证完成 ✓ … MachineID = …"；
+    ///     · 出站重连（走本方法，复用对象）→ **没有**那一行，却照样打
+    ///       "[连接] 已与 … 完成双向认证并注册"。（GUI 日志对重复内容去重，所以早期没看出来。）
+    ///   平时对端健康时这套"跳过验证"还能凑合（双方各自都收到了对方的 Ack）；
+    ///   可一旦对端**此刻并未真正就绪**——最典型就是 **Windows 刚从睡眠唤醒**——Mac 就会
+    ///   连上一条对端不处理的连接：TCP 写成功、日志全绿、UI 显示"已连接"，
+    ///   但对端收不到任何包 ⇒ **鼠标推过去连光标都不出现**（这正是用户 09-20 报的现象）。
     public func reconnect() -> Result<Void, MWBConnectionError> {
         log("[连接] 开始重连 \(host):\(port) …")
+
+        // ① 先作废旧接收线程的代际号，再 close。
+        //    否则有个窄窗口：旧线程从 read 返回 0 后被系统调度延迟，等它走到 `receiveLoop`
+        //    尾部时 `connect()` 可能已经把 `isClosed` 复位成 false，于是那句
+        //    `guard receiveGeneration == gen, !isClosed else { return }` 成立，
+        //    旧线程会替**新**连接打上「对端已关闭连接或读超时」——新连接刚建好就被判死。
+        receiveGeneration += 1
         close()
+
+        // ② 会话级状态清零（见上方注释）。
+        handshakeDone = false
+        magicLearned = false
+        magic = 0
+        log("[连接] 会话状态已重置（handshakeDone / magicLearned）—— 本次将**真正等待**对端 Ack")
+        // 注意：`nextPacketID` **故意不重置** —— 对端按 `Id` 去重（50 条环形），
+        //      重连后从天真的小数字重新开始，可能撞上对端环里残留的旧 Id 而被丢弃。
+        //      让它一路递增下去即可（UInt32 循环空间远大于任何会话时长）。
+
         let r = connect()
         if case .success = r { startReceiveLoop() }
         return r
@@ -453,8 +527,30 @@ public final class MWBConnection {
         }
         // 代际保护：重连会启动新的接收线程，旧线程退出时**不能**再去标记新连接。
         guard receiveGeneration == gen, !isClosed else { return }
-        isClosed = true
+        // ★ 用 close() 而不是只置 isClosed：读失败 = 对端已经走了，**必须把 fd 还回去**。
+        //   2026-09-22 实测：只标记不关 fd ⇒ `lsof` 里堆了 8 个 `CLOSED` 的已死连接
+        //   （Windows 每次回连我们 15101 都会留下一个，永不回收）。fd 是有限资源，
+        //   而且这些僵尸连接还会让「一个 Client 持几条连接」的语义变得不可信。
+        close()
         onDisconnected?("对端已关闭连接或读超时")
+    }
+
+    /// 这条连接是否已关闭（监听器用它来清理死掉的回连）。
+    /// 只是个**尽力而为的快照**：并发下可能读到旧值，用来做数组清理足够。
+    public var closed: Bool { isClosed }
+
+    /// 兜底：对象销毁时确保 socket 一定被关掉（正常路径由 `close()` 负责）。
+    ///
+    /// ⚠️ 这里**打日志是故意的**：2026-09-23 的回连风暴就是"回连对象没人持有、
+    /// 出了作用域立刻析构"造成的 —— 析构即关 fd，对端看到 RST，Windows 的
+    /// `REOPEN_WHEN_WSAECONNRESET` 立刻重连，于是打成每秒 3 次的风暴。
+    /// 出现这行日志 = 又有人忘了持有连接。
+    deinit {
+        if socketFD >= 0 {
+            onLog?("[连接] ⚠️ \(roleLabel)连接对象析构时 socket 仍开着（fd=\(socketFD)）→ 关闭")
+            Darwin.close(socketFD)
+            socketFD = -1
+        }
     }
 
     /// 接收循环专用：把读失败 / 坏包 / 正常包三种情况分开返回。
@@ -536,7 +632,8 @@ public final class MWBConnection {
         // 递归锁：send() 已经持锁时这里再取一次（同一线程，NSRecursiveLock 不阻塞）
         sendLock.lock()
         defer { sendLock.unlock() }
-        guard !isClosed, let out = output else { return .failure(.writeFailed) }
+        let fd = socketFD
+        guard !isClosed, fd >= 0 else { return .failure(.writeFailed) }
         var total = 0
         while total < data.count {
             // ★ 直接用缓冲区指针写，不要 `Array(data[total...])`：
@@ -544,10 +641,9 @@ public final class MWBConnection {
             //   键盘/心跳也在同一条路上，这个拷贝纯属白烧 CPU 和内存带宽。
             let n = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
                 guard let base = raw.baseAddress else { return 0 }
-                return out.write(base.advanced(by: total)
-                                     .assumingMemoryBound(to: UInt8.self),
-                                 maxLength: data.count - total)
+                return Darwin.write(fd, base.advanced(by: total), data.count - total)
             }
+            if n < 0 && errno == EINTR { continue }   // 被信号打断：重来，不算失败
             // n <= 0 只可能是：对端已关闭 / RST / 写超时(SO_SNDTIMEO)。
             // 注意可能是**半包**（total > 0）—— 那意味着这条连接的字节流已经错位，
             // 必须让上层看门狗走重连，绝不能在错位的流上继续写。
@@ -563,13 +659,15 @@ public final class MWBConnection {
     }
 
     private func readRaw(_ count: Int) -> Result<[UInt8], MWBConnectionError> {
-        guard let input = input else { return .failure(.readFailed) }
+        let fd = socketFD
+        guard fd >= 0 else { return .failure(.readFailed) }
         var buf = [UInt8](repeating: 0, count: count)
         var total = 0
         while total < count {
-            let n = input.read(&buf[total], maxLength: count - total)
+            let n = Darwin.read(fd, &buf[total], count - total)
+            if n < 0 && errno == EINTR { continue }
             if n < 0 { return .failure(.readFailed) }
-            if n == 0 { return .failure(.readFailed) } // 对端关闭 / 超时
+            if n == 0 { return .failure(.readFailed) } // 对端关闭（EOF）/ 被 shutdown 唤醒
             total += n
         }
         return .success(buf)
@@ -579,9 +677,154 @@ public final class MWBConnection {
         isClosed = true
         // 先 shutdown 再关：阻塞中的 read() 会立刻被唤醒并返回 0，
         // 接收线程才能及时退出。否则重连时旧线程会一直挂在 read 上不释放。
-        if socketFD >= 0 { shutdown(socketFD, SHUT_RDWR) }
-        input?.close()
-        output?.close()
-        if socketFD >= 0 { Darwin.close(socketFD); socketFD = -1 }
+        let fd = socketFD
+        guard fd >= 0 else { return }
+        socketFD = -1
+        shutdown(fd, SHUT_RDWR)
+        Darwin.close(fd)
+        log("[连接] 已关闭 \(roleLabel)连接 fd=\(fd)")
+    }
+
+    // MARK: - 回归自检
+
+    /// 回归对象 = 2026-09-23「SIGPIPE 静默杀进程」。
+    ///
+    /// 判据的设计要点：**不去读信号处置的值**（`sig_t` 是 C 函数指针，Swift 里不遵循
+    /// `Equatable`，位转比较既绕又脆），而是直接验**行为**：
+    ///   · ② 是「socket 级豁免」的证明 —— 走真实 `applyCoreSocketOptions` 后在
+    ///     `getsockopt` 读回 `SO_NOSIGPIPE = 1`（不是"函数被调过"这种弱断言）；
+    ///   · ③ 是「进程级兜底」的证明 —— 用一个**故意不设任何 socket 选项**的裸 socketpair，
+    ///     若 `SIG_IGN` 没生效，这一行就会把自检进程直接杀掉（根本走不到最后的"通过"）。
+    ///
+    /// **有效性由独立阳性子命令保证**：`--sigpipe-selftest-raw` 把处置恢复默认后做同一操作，
+    /// 必须真的被 SIGPIPE 杀掉（退出码 141）。那边若能正常返回，说明此环境压根不产生
+    /// SIGPIPE ⇒ 本用例是空跑，必须重设计（而不是"通过"）。
+    public static func sigpipeSelfTest() -> Bool {
+        var pass = 0, fail = 0
+        func check(_ ok: Bool, _ name: String, _ detail: String = "") {
+            if ok { pass += 1; print("  ✓ \(name)\(detail.isEmpty ? "" : "（\(detail)）")") }
+            else { fail += 1; print("  ✗ \(name)\(detail.isEmpty ? "" : "（\(detail)）")") }
+        }
+
+        print("SIGPIPE 防护自检（回归「断链重连窗口里 App 无声消失」）")
+
+        // ① 先把进程级兜底装上（幂等）
+        installSIGPIPEIgnore()
+        check(true, "进程级兜底 installSIGPIPEIgnore() 已执行（幂等）")
+
+        // ② socket 级：SO_NOSIGPIPE 真的落到了 fd 上
+        let probe = socket(AF_INET, SOCK_STREAM, 0)
+        if probe >= 0 {
+            applyCoreSocketOptions(fd: probe)
+            var v: Int32 = 0
+            var len = socklen_t(MemoryLayout<Int32>.size)
+            let r = getsockopt(probe, SOL_SOCKET, SO_NOSIGPIPE, &v, &len)
+            check(r == 0 && v == 1, "socket 级 SO_NOSIGPIPE = 1",
+                  "getsockopt 返回 \(r)，读回值 \(v)")
+            Darwin.close(probe)
+        } else {
+            check(false, "socket 级 SO_NOSIGPIPE = 1", "socket() 创建失败（errno=\(errno)）")
+        }
+
+        // ③ 行为：往「对端已关闭」的 socket 写 —— 必须是普通的 -1/EPIPE，而不是把进程带走。
+        //    ★ 这里**故意不调 applyCoreSocketOptions**，专测进程级兜底。
+        var fds: [Int32] = [0, 0]
+        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else {
+            check(false, "写已死 socket 返回 EPIPE 且进程存活", "socketpair 创建失败（errno=\(errno)）")
+            print("\n结果: \(pass)/\(pass + fail) 通过")
+            return false
+        }
+        Darwin.close(fds[1])                 // 对端关闭 ⇒ 本地再写必然 EPIPE
+        var byte: UInt8 = 0x41
+        var n: Int = 0
+        var e: Int32 = 0
+        for _ in 0..<8 {                     // 头一两次可能写进缓冲，多写几次直到失败
+            n = Darwin.write(fds[0], &byte, 1)
+            if n < 0 { e = errno; break }
+        }
+        Darwin.close(fds[0])
+        check(n < 0 && e == EPIPE, "写已死 socket → -1/EPIPE 且进程存活",
+              "write 返回 \(n)，errno = \(e)\(e == EPIPE ? " (EPIPE)" : "")")
+
+        print("\n结果: \(pass)/\(pass + fail) 通过")
+        return fail == 0
+    }
+
+    /// 阳性对照：把 `SIGPIPE` 恢复成默认处置（`SIG_DFL`）后做**同一个写操作**。
+    /// 预期：本进程被 SIGPIPE 杀死 ⇒ 退出码 141（128 + 13），**永远不会正常返回**。
+    /// 若返回了 97/98/99，说明该环境下"写已死 socket"不产生 SIGPIPE，
+    /// `sigpipeSelfTest()` 就是空跑 —— 阳性对照存在的意义就是把这个可能性钉死。
+    public static func sigpipeNegativeControl() -> Int32 {
+        print("阳性对照：恢复 SIGPIPE 默认处置，往已死 socket 写 —— 预期本进程被信号杀死（141）")
+        signal(SIGPIPE, SIG_DFL)
+        var fds: [Int32] = [0, 0]
+        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else {
+            print("⚠️ socketpair 创建失败，本对照无效"); return 99
+        }
+        Darwin.close(fds[1])
+        var byte: UInt8 = 0x41
+        for _ in 0..<8 {
+            let n = Darwin.write(fds[0], &byte, 1)
+            if n < 0 {
+                let e = errno
+                Darwin.close(fds[0])
+                print("⚠️ 写返回 -1/errno=\(e) 但**没有**收到 SIGPIPE —— 本对照无效，自检设计需重做")
+                return 98
+            }
+        }
+        Darwin.close(fds[0])
+        print("⚠️ 全部写成功、既没失败也没收到信号 —— 本对照无效")
+        return 97
+    }
+
+    /// 回归对象 = 2026-09-20「假连接」：
+    /// `reconnect()` 复用同一个 `MWBConnection` 对象，却忘了清 `handshakeDone`
+    /// ⇒ `doHandshake()` 不等对端 `HandshakeAck` 就宣布成功
+    /// ⇒ Windows 睡醒后 Mac 连上一条"对端不处理"的连接，鼠标推过去连光标都不出现。
+    ///
+    /// **本用例的有效性由构造保证**：先把三个标记显式伪造成"已握手过"的状态，
+    /// 再去掉 `reconnect()` 里那三行重置 —— 唯一的清除来源就没了，自检必然失败。
+    ///
+    /// 说明：`reconnect()` 会真去连 `127.0.0.1:1`，那是必然立刻 `ECONNREFUSED` 的地址；
+    /// 重置发生在 `connect()` **之前**，所以连接失败不影响本用例的判据。
+    public static func reconnectResetSelfTest() -> Bool {
+        let c = MWBConnection(host: "127.0.0.1", port: 1,
+                              securityKey: "selftest-not-used", machineName: "selftest", myID: 2)
+        // 伪造"上一次会话已经握手完成"的现场
+        c.handshakeDone = true
+        c.magicLearned = true
+        c.magic = 0x1234
+
+        // 前置断言：三个标记确实可读可写。少了这一步，"reconnect 后变 false"
+        // 有可能只是"压根没设进去"的假通过 —— 那就等于测了个空。
+        guard c.handshakeDone, c.magicLearned, c.magic == 0x1234 else {
+            print("  ✗ 前置条件不成立：会话标记无法被伪造，本自检无效")
+            return false
+        }
+
+        _ = c.reconnect()      // 连不上是预期的；关键是它必须先清状态
+
+        var pass = 0
+        let total = 3
+        if !c.handshakeDone {
+            pass += 1
+            print("  ✓ handshakeDone 已重置（不会再跳过等待对端 Ack）")
+        } else {
+            print("  ✗ handshakeDone 残留 true —— 重连仍是「假握手」")
+        }
+        if !c.magicLearned {
+            pass += 1
+            print("  ✓ magicLearned 已重置（接收侧会重新自校准魔数）")
+        } else {
+            print("  ✗ magicLearned 残留 true")
+        }
+        if c.magic == 0 {
+            pass += 1
+            print("  ✓ magic 已清零")
+        } else {
+            print("  ✗ magic 残留 0x\(String(c.magic, radix: 16))")
+        }
+        print("  结果: \(pass)/\(total) 通过")
+        return pass == total
     }
 }

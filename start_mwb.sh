@@ -12,7 +12,7 @@ PORT="${MWB_PORT:-15101}"
 KEY="${MWB_KEY:?请先设置环境变量 MWB_KEY —— 它等于 Windows 上 PowerToys「无界鼠标」里显示的安全密钥}"
 
 echo "启动 MWB Mac 客户端 → $HOST:$PORT"
-echo "把鼠标撞到屏幕边缘即可接管 Windows；反向推回切回 Mac；Control+Option+Esc 强制收回"
+echo "撞到屏幕【右边缘】接管 Windows；往左推回来；Control+Option+Esc 强制收回"
 echo "Ctrl+C 退出"
 echo "----------------------------------------"
 exec ./bin/mwbmac "$HOST" "$PORT" "$KEY"
