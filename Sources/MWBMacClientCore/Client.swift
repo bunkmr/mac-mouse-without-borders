@@ -398,22 +398,42 @@ public final class MWBClient {
     /// 「对端整夜离线时会不会被我们轰死」，属于必须可回归的东西。
     ///
     /// 曲线：0.5 / 1 / 2 / 4 / 8（前 5 次，对端重启通常几十秒内回来，重试要快）
-    ///       → 8（6~10 次）→ 30（11~30 次）→ 60（31 次起）。
+    ///       → 8（6~10 次）→ 30（11~30 次）→ 60（31~60 次）
+    ///       → 180（61~120 次）→ **600（121 次起的稳态：10 分钟一次）**。
+    ///
+    /// ★★ 稳态必须是「分钟级的稀疏探测」，不能是「60s 永不停歇地敲门」 ★★
+    ///
+    /// 2026-10-06 实测（本版回归的对象）：对端从 23:33 断到次日 10:00，7.5 小时里我们
+    /// 按 60s 封顶重连了 **590 次**。Windows 早上启动 MWB 时，在**它自己配置还没加载完的
+    /// 那个窗口期**里被我们每分钟一次的敲门连着撞上，连判 9 个 `invalidkey`，累计到达
+    /// MWB 的自我保护阈值 → `too many connections` → 它把自己终止了（用户看到弹框）。
+    ///
+    /// 关键从来不是"总次数"，而是**稳态间隔与对端启动窗口的比例**：
+    /// 启动窗口约 10~60 秒 —— 间隔 60s 时撞上的概率约 50%，而且会**连着撞好几次**；
+    /// 间隔 600s 时撞上概率约 10%，且**最多只撞 1 次**，凑不满连接数阈值。
+    /// ⇒ 对端离线越久，我们越要**安静**。「更努力地敲」只会把对方刚起来的服务打死。
     public static func reconnectBackoffDelay(attempt: Int) -> Double {
         let n = max(1, attempt)
         switch n {
         case 1...5: return 0.5 * pow(2.0, Double(n - 1))   // 0.5, 1, 2, 4, 8
         case 6...10: return 8.0
         case 11...30: return 30.0
-        default: return 60.0
+        case 31...60: return 60.0
+        case 61...120: return 180.0
+        default: return 600.0                              // 稳态：10 分钟一次
         }
     }
 
-    /// 重连退避回归自检 —— 判据是「**对端离线时每小时会重试多少次**」。
+    /// 重连退避回归自检 —— 判据是「**对端离线一整夜会重试多少次、稳态间隔多长**」。
     ///
-    /// 回归对象 = 2026-09-22 事故：Windows 关机 9 小时，退避一直封顶在 8s（每次连接还要
-    /// 5s 超时），合计轰了 2400+ 次；对方一开机，还没加载完安全码的 MWB 就被这波连接洪水
-    /// 打入自我保护（`too many connections`）**自行退出**。曲线一改，这里就必须跟着过。
+    /// 回归对象是两起同源事故（症状一模一样：Windows 上 MWB 弹框自己关了 + Mac 连不上）：
+    ///   ① 2026-09-22：Windows 关机 9 小时，退避一直封顶在 8s（每次连接还要 5s 超时），
+    ///      合计轰了 2400+ 次，对端一开机就被打崩；
+    ///   ② 2026-10-06：封顶放宽到 60s，但"永不停歇"这一点没改 —— 7.5 小时仍是 590 次，
+    ///      照样把刚启动的对端 MWB 连判 9 个 invalidkey 后打死。
+    ///
+    /// ⇒ 三条判据：曲线断点正确、9 小时总量 < 200 次、**稳态间隔 ≥ 600s**
+    ///   （只有间隔到分钟级，对端那个 ≈10~60 秒的启动窗口里才"最多只撞 1 次"）。
     public static func reconnectBackoffSelfTest() -> Bool {
         var bad = 0
         func expect(_ attempt: Int, _ want: Double) {
@@ -423,15 +443,28 @@ public final class MWBClient {
             }
         }
         expect(1, 0.5); expect(2, 1); expect(3, 2); expect(4, 4); expect(5, 8)
-        expect(6, 8); expect(10, 8); expect(11, 30); expect(30, 30); expect(31, 60); expect(9999, 60)
+        expect(6, 8); expect(10, 8); expect(11, 30); expect(30, 30)
+        expect(31, 60); expect(60, 60); expect(61, 180); expect(120, 180)
+        expect(121, 600); expect(9999, 600)
 
         // 量化：按本条曲线跑满 9 小时要重试多少次（+5s ≈ 一次连接超时）。
         var t = 0.0, n = 1, newCount = 0
         while t < 32400 { t += reconnectBackoffDelay(attempt: n) + 5; newCount += 1; n += 1 }
-        let oldCount = Int(32400 / 13.5)          // 旧曲线 ≈ 8s 退避 + 5s 超时
-        print("  ✓ 曲线 0.5/1/2/4/8 → 8 → 30 → 60s；对端离线 9 小时：新 \(newCount) 次 vs 旧 \(oldCount) 次")
-        if newCount > 700 {
-            print("  ✗ 9 小时仍要重试 \(newCount) 次，过多（判据 <700）"); bad += 1
+        let v143 = 590                             // 2026-10-06 实测：60s 封顶跑 7.5 小时
+        let v142 = Int(32400 / 13.5)               // 2026-09-22 旧曲线：8s 退避 + 5s 超时
+        let steady = reconnectBackoffDelay(attempt: 100_000)
+        let hitsPerWindow = Int(ceil(60.0 / steady))   // 对端启动窗口 60s 内会撞几次
+        print("  ✓ 曲线 0.5/1/2/4/8 → 8 → 30 → 60 → 180 → **\(Int(steady))s 稳态**")
+        print("    对端离线 9 小时：本版 \(newCount) 次 ｜ 60s 封顶 \(v143) 次（实测）｜ 8s 封顶 \(v142) 次（旧）")
+        print("    稳态间隔 \(Int(steady))s ⇒ 对端启动窗口(≈10~60s)内最多撞 \(hitsPerWindow) 次")
+        if newCount > 200 {
+            print("  ✗ 9 小时仍要重试 \(newCount) 次，过多（判据 <200）"); bad += 1
+        }
+        if steady < 600 {
+            print("  ✗ 稳态间隔只有 \(Int(steady))s，对端启动窗口内会连着撞好几次（判据 ≥600s）"); bad += 1
+        }
+        if hitsPerWindow > 1 {
+            print("  ✗ 启动窗口内会撞 \(hitsPerWindow) 次，凑得满对端的连接数阈值（判据 ≤1）"); bad += 1
         }
         return bad == 0
     }
@@ -440,20 +473,28 @@ public final class MWBClient {
         guard !reconnectScheduled else { return }
         reconnectScheduled = true
         reconnectAttempts += 1
-        // 退避：0.5 → 1 → 2 → 4 → 8s（前 5 次）；6~10 次 8s，11~30 次 30s，31 次起 60s。
+        // 退避：0.5 → 1 → 2 → 4 → 8s（前 5 次）；6~10 次 8s，11~30 次 30s，31~60 次 60s，
+        //       61~120 次 180s，**121 次起 600s（10 分钟）**。
         //
-        // 【为什么必须把间隔放长】2026-09-22 事故：Windows 关机期间我们每 ~13.5s 重连一次，
-        // 连续 9 小时轰了 2400+ 次；对方一开机，MWB 还没把安全码加载完就被这波连接洪水打进，
-        // 连续判 invalidkey，最终触发它自己的保护 `too many connections` **直接退出** ——
+        // 【为什么必须把间隔放到分钟级】两起同源事故：
+        //   · 2026-09-22 —— Windows 关机期间我们每 ~13.5s 重连一次，9 小时轰了 2400+ 次；
+        //   · 2026-10-06 —— 封顶放宽到 60s，但"永不停歇"没改，7.5 小时仍是 590 次。
+        // 两次的结果都一样：**对方一开机，MWB 还没把安全码加载完就被这波敲门打进**，
+        // 连续判 `invalidkey`，最终触发它自己的保护 `too many connections` **直接退出** ——
         // 用户看到的就是「Windows 上 MWB 弹框自己关了 + Helper 报错，Mac 再也连不上」。
-        // 也就是说：连接本身没成本，但**对端 MWB 会记连接数**，慢下来反而是能连上的前提。
+        //
+        // 所以：连接本身对我们没成本，但**对端 MWB 会记连接数**。对端离线越久，
+        // 越要安静下来 —— 慢，才是能连上的前提。
         let delay = Self.reconnectBackoffDelay(attempt: reconnectAttempts)
         log("[MWB] [重连] 第 \(reconnectAttempts) 次尝试将在 \(String(format: "%.1f", delay))s 后开始")
         // 长时间连不上时给一条可操作的提示（别让用户对着刷屏日志毫无头绪）。
-        if reconnectAttempts == 20 || reconnectAttempts == 100 || reconnectAttempts % 500 == 0 {
+        if reconnectAttempts == 20 || reconnectAttempts == 60
+            || reconnectAttempts == 120 || reconnectAttempts % 240 == 0 {
             log("[MWB] [重连] ⓘ 已连续重试 \(reconnectAttempts) 次仍未连上。若 Windows 已开机："
                 + "① 确认托盘里有 Mouse Without Borders 且在运行（它有自我保护，可能已自行退出）；"
-                + "② 核对两边安全码一致。本机将继续以 60s 间隔重试，不会放弃。")
+                + "② 核对两边安全码一致。本机已转入 \(Int(delay))s 一次的低频探测 —— "
+                + "刻意**不去密集敲门**：对端 MWB 刚启动时配置尚未加载完，被连接洪水撞上会判 "
+                + "invalidkey 并自我保护退出，越快反而越连不上。")
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
@@ -1137,7 +1178,10 @@ public final class MWBClient {
             + (retry ? "（切机补拉）" : ""))
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            switch ch.fetchPayload(from: self.host, postAction: .other) {
+            // ★ origin = .clipboardAnnounce：对端宣布的是**剪贴板内容**。
+            //   若它把图片当文件发（微信输入法等剪贴板管理器会把图片落成临时 PNG），
+            //   我们按图片收进剪贴板，而不是扔到桌面（见 `PayloadOrigin`）。
+            switch ch.fetchPayload(from: self.host, postAction: .other, origin: .clipboardAnnounce) {
             case .success(let payload):
                 switch payload {
                 case .image(let png):      _ = self.clipboard.acceptRemoteImage(png)

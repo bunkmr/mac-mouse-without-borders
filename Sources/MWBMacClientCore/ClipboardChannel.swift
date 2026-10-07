@@ -48,6 +48,7 @@
 //   但本机对端不是那个版本 —— 以实测为准，与主通道保持完全一致。）
 
 import Foundation
+import AppKit
 import Darwin
 
 // MARK: - 通道数据载荷
@@ -126,6 +127,57 @@ public enum MWBPostAction: UInt32 {
 }
 
 // MARK: - 通道
+
+/// 这次拉取/接收的**来源**，只在「图片类文件」的处置上有区别。
+///
+/// 【为什么必须区分】Windows 端把剪贴板里的图片**当成文件发**是常态：
+/// 微信输入法（WeType）之类剪贴板管理器会把图片落成一个临时 PNG
+/// （实测原始路径 `C:\Users\...\AppData\LocalLow\Tencent\WeType\ClipboardTmp\<ts>_d.png`），
+/// 于是 Windows MWB 走的是"文件"分支 —— 1024 字节头里写的是**文件名**而不是 `image`。
+/// 我们若照文件处理，就会把它写进 `~/Desktop/MouseWithoutBorders/` 并弹 Finder，
+/// 用户看到的现象是「**每复制一次就往桌面扔一张照片**」（2026-10-06 反馈）。
+///
+/// 判据只能是"这次是谁触发的"：
+///   · 由对端 `Clipboard(69)` 心跳/宣布触发 → 那是**剪贴板内容**，图片就该进剪贴板；
+///   · 由拖放投放触发 → 那是用户真要的**文件**，图片就该落盘。
+public enum PayloadOrigin {
+    /// 对端宣布"我剪贴板里有东西" → 我们去拉。图片一律写进本机剪贴板，不落盘。
+    case clipboardAnnounce
+    /// 拖放投放（DragDrop）→ 图片是用户要的文件，照常落盘。
+    case dragDrop
+}
+
+/// 对端头包归类结果 —— **纯函数产物**，不碰网络、不碰磁盘，因此可以被自检穷举。
+///
+/// 【为什么要把这段抽出来】「复制一次就往桌面扔一张照片」这个 bug 的全部判据都在这里：
+/// 它是 `origin` × `文件名` × `size` 的**组合**判断，只测扩展名集合（`imageFileExtensions`）
+/// 是测不到它的 —— 必须把组合本身钉进自检，否则以后有人改回"只要像图片就落盘"，
+/// 扩展名自检照样全绿。见 `ClipboardIntakeSelfTest`。
+public enum IncomingKind: Equatable {
+    /// 对端的提示文字被塞进了"文件名"字段（如「File too big」）—— 不是文件，不落盘。
+    case peerNotice(String)
+    /// 线格式图片（头里就是 `image`，PNG 原始字节）→ 本机剪贴板。
+    case imageWire
+    /// 线格式文本（头里是 `text`）→ 本机剪贴板。
+    case textWire
+    /// 剪贴板宣布里以**文件形式**到达的图片（实测微信输入法 WeType 的临时 PNG）→ 剪贴板。
+    case clipboardImageFile
+    /// 真文件 → 落盘到「桌面/MouseWithoutBorders/」。
+    case file
+
+    /// 是否进内存（即写进剪贴板）而非落盘。
+    public var goesToClipboard: Bool {
+        switch self {
+        case .imageWire, .textWire, .clipboardImageFile: return true
+        case .peerNotice, .file:                          return false
+        }
+    }
+
+    public var isPeerNotice: Bool {
+        if case .peerNotice = self { return true }
+        return false
+    }
+}
 
 public final class MWBClipboardChannel {
 
@@ -254,7 +306,13 @@ public final class MWBClipboardChannel {
 
         if session.peerIsPusher {
             // 对端发的是 ClipboardPush(79) → 它要推数据给我们（Windows → Mac）
-            switch receiveData(fd: fd, dec: session.dec, postAction: session.peerPostAction) {
+            //
+            // 来源判据：对端头包里的 PostAction。**Desktop(1) 才是"这是一份要落桌面的文件"**
+            // （Windows 拖放投放时这么标）；其余取值说明推的是剪贴板内容 —— 图片按剪贴板收。
+            let origin: PayloadOrigin = (session.peerPostAction == MWBPostAction.desktop.rawValue)
+                ? .dragDrop : .clipboardAnnounce
+            switch receiveData(fd: fd, dec: session.dec, postAction: session.peerPostAction,
+                               origin: origin) {
             case .success(let payload): onPayloadReceived?(payload)
             case .failure(let e):       log("[剪贴板] ✗ 接收失败: \(e.localizedDescription)")
             }
@@ -356,7 +414,8 @@ public final class MWBClipboardChannel {
     /// 对称于 PowerToys `Clipboard.ConnectAndGetData`：请求方发 `Clipboard(69)`，
     /// 数据持有方回 `ClipboardPush(79)`，于是本端负责接收。
     /// 拿到的是文件还是剪贴板内容，**由对端头里的类型名决定**（见 `MWBClipboardPayload`）。
-    public func fetchPayload(from host: String, postAction: MWBPostAction = .other)
+    public func fetchPayload(from host: String, postAction: MWBPostAction = .other,
+                             origin: PayloadOrigin = .dragDrop)
         -> Result<MWBClipboardPayload, MWBClipboardError> {
         let fd = connectSocket(host: host, port: port)
         guard fd >= 0 else {
@@ -374,12 +433,12 @@ public final class MWBClipboardChannel {
             // 对端也发了 Clipboard(69) —— 双方都以为自己是请求方，协议上不该出现
             return .failure(.rejected("对端未接管推送角色（双方角色冲突）"))
         }
-        return receiveData(fd: fd, dec: session.dec, postAction: postAction.rawValue)
+        return receiveData(fd: fd, dec: session.dec, postAction: postAction.rawValue, origin: origin)
     }
 
     /// 只要文件的旧接口（拖放路径专用）。对端推来的是剪贴板内容时判为失败。
     public func fetchFile(from host: String, postAction: MWBPostAction = .other) -> Result<URL, MWBClipboardError> {
-        switch fetchPayload(from: host, postAction: postAction) {
+        switch fetchPayload(from: host, postAction: postAction, origin: .dragDrop) {
         case .failure(let e): return .failure(e)
         case .success(.file(let u)): return .success(u)
         case .success(let other):
@@ -595,8 +654,10 @@ public final class MWBClipboardChannel {
     /// `ReceiveAndProcessClipboardDataCore` 的 `StartsWith("image"/"text")` 判定）：
     ///   `image`  → 剪贴板图片，收进内存（PNG 原始字节）
     ///   `text`   → 剪贴板文本，收进内存（DEFLATE 压缩的打包串）
-    ///   其它     → 文件，落盘到 `桌面/MouseWithoutBorders/`
-    private func receiveData(fd: Int32, dec: CBCContext, postAction: UInt32)
+    ///   图片类文件 + `origin == .clipboardAnnounce` → 同样收进内存（写剪贴板，**不落盘**）
+    ///   其余     → 文件，落盘到 `桌面/MouseWithoutBorders/`
+    private func receiveData(fd: Int32, dec: CBCContext, postAction: UInt32,
+                             origin: PayloadOrigin)
         -> Result<MWBClipboardPayload, MWBClipboardError> {
         // ① 1024 字节头
         let headRaw: [UInt8]
@@ -621,54 +682,33 @@ public final class MWBClipboardChannel {
             return .failure(.ioFailed("头格式异常: \(header.prefix(80))"))
         }
         let remotePath = String(parts[1])
-        // ★★ 必须把 Windows 的反斜杠归一化，否则整条路径会变成文件名 ★★
-        //
-        // 对端发来的头里是 **Windows 路径**，实测长这样：
-        //   C:\Users\YourName\Desktop\MouseWithoutBorders\PixPin_2026-08-30_21-39-51.png
-        // 而 `NSString.lastPathComponent` **只认 "/"** —— 遇到反斜杠路径它会原样返回，
-        // 于是我们把「整条路径」当成了文件名。更坑的是 macOS 里 ":" 是合法字符
-        // 但 Finder 会把它**显示成 "/"**，所以用户看到的名字就是一条完整路径
-        // （2026-09-14 用户报的「文件名有问题是整个路径」就是这个）。
-        // 修法：先把 "\" 换成 "/"，再取末段；最后把残留的 ":" 换成 "_" 兜底。
-        let normalized = remotePath.replacingOccurrences(of: "\\", with: "/")
-        var baseName = (normalized as NSString).lastPathComponent
-        baseName = baseName.replacingOccurrences(of: ":", with: "_")
-        guard !baseName.isEmpty, baseName != ".", baseName != ".." else {
+        guard let baseName = Self.baseName(fromRemotePath: remotePath) else {
             return .failure(.ioFailed("对端给出的文件名不可用: \(remotePath.suffix(80))"))
         }
 
-        // ② 是不是剪贴板内容？（内存型载荷，不落盘）
-        let lower = baseName.lowercased()
-        let isImageWire = lower.hasPrefix("image")
-        let isTextWire  = lower.hasPrefix("text")
-        let toMemory = isImageWire || isTextWire
+        // ② 归类（纯函数，判据集中在 `IncomingKind`）
+        let cls = Self.classifyIncoming(baseName: baseName, size: size, origin: origin)
+        if case .peerNotice(let notice) = cls {
+            return .failure(.rejected("对端提示（文件未传输）：\(notice)"))
+        }
+        let toMemory = cls.goesToClipboard
 
         let out: FileHandle?
         let dest: URL?
         if toMemory {
-            log("[剪贴板] 对端来剪贴板\(isImageWire ? "图片" : "文本")：\(fmtBytes(size))")
+            let kind = (cls == .imageWire) ? "图片" : ((cls == .textWire) ? "文本" : "图片（以文件形式到达）")
+            log("[剪贴板] 对端来剪贴板\(kind)：\(fmtBytes(size))"
+                + (baseName == remotePath ? "" : "  原始名=\(baseName)"))
             dest = nil
             out = nil
         } else {
             log("[剪贴板] 对端来文件：\(baseName)（\(fmtBytes(size))）"
                 + (baseName == remotePath ? "" : "  原始路径=\(remotePath)"))
             // 落点：桌面\MouseWithoutBorders\（与 Windows 端 postAction=desktop 的习惯对齐）
-            let home = FileManager.default.homeDirectoryForCurrentUser
-            let dir = home.appendingPathComponent("Desktop/MouseWithoutBorders", isDirectory: true)
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            var d = dir.appendingPathComponent(baseName)
-            // 重名自动加序号，避免覆盖
-            var n = 1
-            while FileManager.default.fileExists(atPath: d.path) {
-                let stem = (baseName as NSString).deletingPathExtension
-                let ext = (baseName as NSString).pathExtension
-                let name = ext.isEmpty ? "\(stem) (\(n))" : "\(stem) (\(n)).\(ext)"
-                d = dir.appendingPathComponent(name)
-                n += 1
-            }
-            FileManager.default.createFile(atPath: d.path, contents: nil)
-            guard let fh = FileHandle(forWritingAtPath: d.path) else {
-                return .failure(.ioFailed("无法写入 \(d.path)"))
+            guard let d = Self.prepareIncomingFileURL(baseName: baseName),
+                  FileManager.default.createFile(atPath: d.path, contents: nil),
+                  let fh = FileHandle(forWritingAtPath: d.path) else {
+                return .failure(.ioFailed("无法在桌面创建 \(baseName)"))
             }
             dest = d
             out = fh
@@ -699,18 +739,127 @@ public final class MWBClipboardChannel {
             remaining -= Int64(take)
         }
 
-        if isImageWire {
+        if cls == .imageWire {
             log("[剪贴板] ✓ 已收到图片（\(fmtBytes(Int64(buf.count)))，"
                 + "PNG 魔数=\(ClipboardSync.looksLikePNG(Data(buf)) ? "✓" : "✗")）")
             return .success(.image(Data(buf)))
         }
-        if isTextWire {
+        if cls == .textWire {
             log("[剪贴板] ✓ 已收到文本（压缩后 \(fmtBytes(Int64(buf.count)))）")
             return .success(.textWire(buf))
         }
-        guard let dest else { return .failure(.ioFailed("落盘路径缺失")) }
+        if cls == .clipboardImageFile, NSImage(data: Data(buf)) != nil {
+            log("[剪贴板] ✓ 对端剪贴板里的图片以「文件」形式到达（\(baseName)，"
+                + "\(fmtBytes(Int64(buf.count)))）→ 已写入本机剪贴板（不落盘、不弹 Finder）")
+            return .success(.image(Data(buf)))
+        }
+        guard let dest else {
+            // clipboardImageFile 但内容解不开 → 退回落盘，别把数据丢了
+            guard let d = Self.writeIncomingFile(baseName: baseName, bytes: buf) else {
+                return .failure(.ioFailed("无法写入 \(baseName)"))
+            }
+            log("[剪贴板] ⚠️ \(baseName) 看着像图片却解不开，已按普通文件落盘 → \(d.path)")
+            return .success(.file(d))
+        }
         log("[剪贴板] ✓ 已保存到 \(dest.path)")
         return .success(.file(dest))
+    }
+
+    // MARK: - 接收文件：判定与落点
+
+    /// 从对端头里的「路径 / 名字」得到安全的本地文件名。返回 nil = 不可用。
+    ///
+    /// ★★ 必须把 Windows 的反斜杠归一化，否则整条路径会变成文件名 ★★
+    ///
+    /// 对端发来的头里是 **Windows 路径**，实测长这样：
+    ///   C:\Users\user\Desktop\MouseWithoutBorders\PixPin_2026-01-01_12-00-00.png
+    /// 而 `NSString.lastPathComponent` **只认 "/"** —— 遇到反斜杠路径它会原样返回，
+    /// 于是我们把「整条路径」当成了文件名。更坑的是 macOS 里 ":" 是合法字符
+    /// 但 Finder 会把它**显示成 "/"**，所以用户看到的名字就是一条完整路径
+    /// （2026-09-14 用户报的「文件名有问题是整个路径」就是这个）。
+    /// 修法：先把 "\" 换成 "/"，再取末段；最后把残留的 ":" 换成 "_" 兜底。
+    public static func baseName(fromRemotePath remotePath: String) -> String? {
+        let normalized = remotePath.replacingOccurrences(of: "\\", with: "/")
+        let b = (normalized as NSString).lastPathComponent
+            .replacingOccurrences(of: ":", with: "_")
+        guard !b.isEmpty, b != ".", b != ".." else { return nil }
+        return b
+    }
+
+    /// 会被 Windows 当成"文件名"发过来的错误提示
+    /// （实测：源文件 > 100MB 时 MWB 把整句话塞进路径字段，size=0）。
+    static let peerErrorMarkers = ["file too big", "please drag and drop the file"]
+
+    static func looksLikePeerError(_ name: String) -> Bool {
+        let l = name.lowercased()
+        return peerErrorMarkers.contains { l.contains($0) }
+    }
+
+    /// 会被当成"剪贴板图片"来处置的扩展名。
+    static let imageFileExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "jfif", "gif", "bmp", "tif", "tiff",
+        "webp", "heic", "heif", "ico", "icns",
+    ]
+
+    /// ★★ 「这次该进剪贴板还是该落盘」的**唯一判据**（纯函数，可被自检穷举）★★
+    ///
+    /// 三种进剪贴板的情形：
+    ///   · 头里就写着 `image` / `text`（线格式，对端直推的剪贴板内容）；
+    ///   · 头里是**图片文件路径**，且 `origin == .clipboardAnnounce` 且体积合理。
+    ///     ← 这一条就是「复制一次就往桌面扔一张照片」的修复点：
+    ///       Windows 的剪贴板管理器（实测微信输入法 WeType）会把图片落成临时 PNG，
+    ///       Windows MWB 于是按"文件"分支发过来，我们照着落盘就成了往桌面扔照片。
+    ///   · 其余（尤其 `origin == .dragDrop` 的图片）一律落盘 ——
+    ///     用户真从 Windows 拖了个 PNG 过来，那是他要的文件，不能塞进剪贴板了事。
+    ///
+    /// `size == 0` 的"文件名"若是对端提示语，直接判为提示，避免产出 0 字节伪文件。
+    public static func classifyIncoming(baseName: String, size: Int64,
+                                        origin: PayloadOrigin) -> IncomingKind {
+        let lower = baseName.lowercased()
+        let isImageWire = lower.hasPrefix("image")
+        let isTextWire  = lower.hasPrefix("text")
+
+        // 对端的「文件太大」提示会被塞进路径字段当文件名发过来（实测 size=0）：
+        //   "km261006.zip - File too big (greater than 100MB), please drag and drop the file instead!"
+        if !isImageWire, !isTextWire, size == 0, looksLikePeerError(baseName) {
+            return .peerNotice(baseName)
+        }
+        if isImageWire { return .imageWire }
+        if isTextWire  { return .textWire }
+
+        let ext = (baseName as NSString).pathExtension.lowercased()
+        let asClipboardImage = (origin == .clipboardAnnounce)
+            && imageFileExtensions.contains(ext)
+            && size > 0 && size <= Int64(ClipboardSync.imageLimit)
+        return asClipboardImage ? .clipboardImageFile : .file
+    }
+
+    /// 收到文件时的落点：`~/Desktop/MouseWithoutBorders/`，重名自动加序号（不覆盖）。
+    static func prepareIncomingFileURL(baseName: String) -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let dir = home.appendingPathComponent("Desktop/MouseWithoutBorders", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            guard FileManager.default.fileExists(atPath: dir.path) else { return nil }
+        }
+        var d = dir.appendingPathComponent(baseName)
+        var n = 1
+        while FileManager.default.fileExists(atPath: d.path) {
+            let stem = (baseName as NSString).deletingPathExtension
+            let ext = (baseName as NSString).pathExtension
+            let name = ext.isEmpty ? "\(stem) (\(n))" : "\(stem) (\(n)).\(ext)"
+            d = dir.appendingPathComponent(name)
+            n += 1
+        }
+        return d
+    }
+
+    /// 把已在内存里的字节写到落点（给"按图片收但解码失败"的兜底用）。
+    static func writeIncomingFile(baseName: String, bytes: [UInt8]) -> URL? {
+        guard let d = prepareIncomingFileURL(baseName: baseName) else { return nil }
+        guard FileManager.default.createFile(atPath: d.path, contents: Data(bytes)) else { return nil }
+        return d
     }
 
     // MARK: - 发送剪贴板载荷（供对端来拉时用）
@@ -873,4 +1022,88 @@ func fmtBytes(_ b: Int64) -> String {
     if b < 1024 * 1024 { return String(format: "%.1f KB", Double(b) / 1024) }
     if b < 1024 * 1024 * 1024 { return String(format: "%.1f MB", Double(b) / 1024 / 1024) }
     return String(format: "%.2f GB", Double(b) / 1024 / 1024 / 1024)
+}
+
+// MARK: - 接收归类自检
+
+/// 回归 2026-10-06「每复制一次就往桌面扔一张照片」：
+/// Windows 把剪贴板图片当**文件**发（微信输入法会把图片落成临时 PNG），
+/// 我们若按文件落盘，桌面就会被照片塞满。判据 = 来源（剪贴板宣布 vs 拖放）。
+public enum ClipboardIntakeSelfTest {
+
+    public static func run() -> Bool {
+        var fails: [String] = []
+        func check(_ name: String, _ cond: Bool) { if !cond { fails.append(name) } }
+
+        // ① 图片扩展名判定
+        for e in ["png", "jpg", "jpeg", "tif", "tiff", "webp", "heic"] {
+            check("\(e) 应判为图片", MWBClipboardChannel.imageFileExtensions.contains(e))
+        }
+        for e in ["zip", "pdf", "txt", "exe", ""] {
+            check("\(e) 不应判为图片", !MWBClipboardChannel.imageFileExtensions.contains(e))
+        }
+
+        // ② 对端的「文件太大」提示（实测原文，注意它带着 .zip 后缀，扩展名判定骗不过）
+        let real = "km261006.zip - File too big (greater than 100MB), please drag and drop the file instead!"
+        check("识别对端「文件太大」提示", MWBClipboardChannel.looksLikePeerError(real))
+        check("正常文件名不误判", !MWBClipboardChannel.looksLikePeerError("holiday-photo.png"))
+        check("正常文件名不误判（含 Big）", !MWBClipboardChannel.looksLikePeerError("BigData.zip"))
+
+        // ③ 文件名归一化（反斜杠 Windows 路径 → 末段；冒号兜底；拒绝空/./..）
+        check("反斜杠路径取末段",
+              MWBClipboardChannel.baseName(fromRemotePath: #"C:\Users\user\Desktop\MouseWithoutBorders\a.png"#)
+              == "a.png")
+        check("正斜杠路径取末段",
+              MWBClipboardChannel.baseName(fromRemotePath: "/Users/user/Pictures/b.JPG") == "b.JPG")
+        check("只剩文件名时原样返回",
+              MWBClipboardChannel.baseName(fromRemotePath: "c.txt") == "c.txt")
+        check("冒号换下划线",
+              MWBClipboardChannel.baseName(fromRemotePath: #"C:\tmp\we:ird.txt"#) == "we_ird.txt")
+        check("空串不可用", MWBClipboardChannel.baseName(fromRemotePath: "") == nil)
+        check("「..」不可用", MWBClipboardChannel.baseName(fromRemotePath: #"a\.."#) == nil)
+
+        // ④ WeType 剪贴板临时目录里的真实样本必须被识别成图片类文件
+        let weType = #"C:\Users\user\AppData\LocalLow\Tencent\WeType\ClipboardTmp\1791291141022_d.png"#
+        let bn = MWBClipboardChannel.baseName(fromRemotePath: weType)
+        check("WeType 临时 PNG 取到 1791291141022_d.png", bn == "1791291141022_d.png")
+        check("WeType 临时 PNG 判为图片类",
+              bn.map { MWBClipboardChannel.imageFileExtensions.contains(($0 as NSString).pathExtension.lowercased()) } == true)
+        check("同一样本**不**像对端错误提示", bn.map { !MWBClipboardChannel.looksLikePeerError($0) } == true)
+
+        // ⑤ ★ 组合判定：classifyIncoming 才是真正的判据（本 bug 的回归锁）
+        //
+        // 【为什么必须测组合】上面 ①~④ 全是"零件"：只测扩展名集合的话，
+        // 就算有人把代码改回"只要像图片就落盘"，①~④ 依然全绿 —— 这个 bug 就复活了。
+        let C = MWBClipboardChannel.self
+        let weName = "1791291141022_d.png"
+        check("剪贴板宣布 + PNG 文件 ⇒ 进剪贴板（不落盘）",
+              C.classifyIncoming(baseName: weName, size: 240_000, origin: .clipboardAnnounce) == .clipboardImageFile)
+        check("拖放投放 + 同一个 PNG ⇒ 落盘（用户真要的文件）",
+              C.classifyIncoming(baseName: weName, size: 240_000, origin: .dragDrop) == .file)
+        check("剪贴板宣布 + 非图片扩展名 ⇒ 照样落盘（可能是真复制的文件）",
+              C.classifyIncoming(baseName: "报表.zip", size: 4096, origin: .clipboardAnnounce) == .file)
+        check("剪贴板宣布 + 图片但 size=0 ⇒ 不落盘（0 字节伪文件）",
+              C.classifyIncoming(baseName: "ghost.png", size: 0, origin: .clipboardAnnounce) == .file)
+        check("剪贴板宣布 + 图片但超过 50MB 上限 ⇒ 落盘（别把大图塞进内存）",
+              C.classifyIncoming(baseName: "huge.png", size: Int64(ClipboardSync.imageLimit) + 1,
+                                 origin: .clipboardAnnounce) == .file)
+        check("剪贴板宣布 + 恰好 50MB ⇒ 仍进剪贴板（边界包含）",
+              C.classifyIncoming(baseName: "edge.png", size: Int64(ClipboardSync.imageLimit),
+                                 origin: .clipboardAnnounce) == .clipboardImageFile)
+        check("头里是 image ⇒ 线格式图片，与 origin 无关",
+              C.classifyIncoming(baseName: "image", size: 512, origin: .dragDrop) == .imageWire)
+        check("头里是 text ⇒ 线格式文本，与 origin 无关",
+              C.classifyIncoming(baseName: "text", size: 512, origin: .dragDrop) == .textWire)
+        check("对端「文件太大」提示 ⇒ 既不入剪贴板也不落盘",
+              C.classifyIncoming(baseName: real, size: 0, origin: .clipboardAnnounce).isPeerNotice)
+        check("goesToClipboard 与枚举一致",
+              IncomingKind.clipboardImageFile.goesToClipboard
+              && !IncomingKind.file.goesToClipboard
+              && !IncomingKind.peerNotice("x").goesToClipboard)
+
+        print(fails.isEmpty
+              ? "  ✓ 剪贴板接收归类全过（扩展名 / 对端提示 / 路径归一化 / WeType 样本 / 组合判定）"
+              : "  ✗ 剪贴板接收归类失败：\n    " + fails.joined(separator: "\n    "))
+        return fails.isEmpty
+    }
 }

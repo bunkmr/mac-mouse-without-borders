@@ -25,6 +25,16 @@ public struct MachineSlot: Identifiable, Equatable {
     /// 该槽位名字是不是**从 Matrix 包**来的（权威），false = 从心跳推测
     public var fromMatrix: Bool = false
 
+    /// 显式公开构造器。
+    /// （`public struct` 的**隐式** memberwise init 是 internal 的，GUI 那侧要构造
+    ///  「4 个空格子」的占位棋盘时用得到，必须显式给一个 public 的。）
+    public init(id: Int, name: String = "", lastSeen: Date? = nil, fromMatrix: Bool = false) {
+        self.id = id
+        self.name = name
+        self.lastSeen = lastSeen
+        self.fromMatrix = fromMatrix
+    }
+
     public var occupied: Bool { !name.isEmpty }
 
     /// 在线判据：最近 10 秒内有过消息（MWB 心跳是秒级的）。

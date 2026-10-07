@@ -167,17 +167,39 @@ pkill -f "/Applications/$APPNAME.app/Contents/MacOS/" 2>/dev/null || true
 sleep 0.8
 # 先清掉命令行工具留下的临时文件，别让它们被算进签名封印
 find "$APP" \( -name '.BC.T_*' -o -name '._*' -o -name '.DS_Store' -o -name '*.cstemp*' \) -delete 2>/dev/null || true
+# ★★ 先落到 /Applications 里的**临时名**，校验通过才顶替旧包 ★★
+#
+# 2026-10-06 事故：`ditto` 直写 `/Applications/MWB.app` 时，写文件的沙箱代理把真正的
+# 文件全部换成 `.BC.T_xxxxxx` 临时文件（内容全丢），而**旧包已经先被 mv 走了** ⇒
+# /Applications/MWB.app 成了一个只剩空目录的半成品，App 直接打不开；更坑的是
+# `ditto` 仍然返回 0，`set -e` 没拦住，脚本照报"✅ 完成"。
+# ⇒ 现在：写临时名 → 断言可执行文件真的存在且非空 → 再原子改名顶替。
+#    任何一步不过就**中止且不动旧包**，用户至少还有一个能用的 App。
+# ⚠️ 暂存目录名**不能以点开头**：写成 `/Applications/.MWB.new.app` 时，
+#    这里那层写文件的代理会把整个写入过滤掉 —— `ditto` 照样返回 0，
+#    但目标只剩一个空目录（2026-10-06 实测又踩一次）。用普通名字即可。
+STAGE="/Applications/$APPNAME.new.app"
+rm -rf "$STAGE"
+ditto "$APP" "$STAGE"
+# 清掉写文件代理留下的临时文件（它们会被算进签名封印，导致 verify 报
+# "a sealed resource is missing or invalid"）
+find "$STAGE" \( -name '._*' -o -name '.DS_Store' -o -name '*.cstemp*' -o -name '.BC.T_*' \) -delete 2>/dev/null || true
+
+if [ ! -x "$STAGE/Contents/MacOS/MWBMacClientApp" ] || [ ! -s "$STAGE/Contents/MacOS/MWBMacClientApp" ]; then
+    echo "❌ 安装中止：写进 /Applications 的包是**半成品**（缺可执行文件或是空壳）。"
+    echo "   旧包**没有被动过**，App 仍可用。已签好的完整包还在：$APP"
+    echo "   多半是写文件的沙箱代理又插了一手。补救："
+    echo "     ditto $APP /Applications/$APPNAME.app"
+    rm -rf "$STAGE"
+    exit 1
+fi
+
 if [ -d "/Applications/$APPNAME.app" ]; then
     mkdir -p "$HOME/.Trash"
     mv "/Applications/$APPNAME.app" "$HOME/.Trash/$APPNAME-old-$(date +%Y%m%d-%H%M%S).app" 2>/dev/null \
         || rm -rf "/Applications/$APPNAME.app"
 fi
-ditto "$APP" "/Applications/$APPNAME.app"
-# 兜底再清一遍可疑临时文件（.app 装在本地 APFS 卷，不会有 AppleDouble 干扰，
-# 但保留这步以防有人把工程挪到同步卷上构建）。
-find "/Applications/$APPNAME.app" \( -name '._*' -o -name '.DS_Store' -o -name '*.cstemp*' -o -name '.BC.T_*' \) -delete 2>/dev/null || true
-codesign --force --deep --sign "$SIGN_ID" "/Applications/$APPNAME.app"
-codesign --verify --deep "/Applications/$APPNAME.app" && echo "  ✅ 签名校验通过"
+mv "$STAGE" "/Applications/$APPNAME.app"
 
 # 清掉历史同名残留，避免 TCC 列表里出现「勾了 A 却跑 B」
 rm -rf /Applications/MWBMacClient.app 2>/dev/null || true

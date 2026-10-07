@@ -2812,15 +2812,15 @@ public final class InputController {
 
     /// 是否顶到触发边缘（并且再向外推）。
     /// 注意 CGEvent.location 是【左上原点】：y 越小越靠上。
+    ///
+    /// ★★ 判据取「整块桌面的外边界」，**不是**"光标所在那块屏" ★★
+    /// 曾经写成 `localScreenFrame(containing: loc)`，于是多显示器时**内屏之间的接缝**
+    /// 被误判成出界点：内建屏在主屏右侧时，光标一移进内建屏（x≈内建屏.minX）
+    /// 就满足 `x ≤ f.minX + 1` ⇒ 往右挪鼠标却触发了"左边缘"跨屏。
+    /// 完整复盘与现场分辨率见 `ScreenLayout.hitsEdge` 的注释。
     private func hasCrossedEdge(_ loc: CGPoint) -> Bool {
-        let f = localScreenFrame(containing: loc)
-        let atEdge: Bool
-        switch switchEdge {
-        case .right:  atEdge = loc.x >= f.maxX - 1
-        case .left:   atEdge = loc.x <= f.minX + 1
-        case .top:    atEdge = loc.y <= f.minY + 1     // 上边缘 = y 最小
-        case .bottom: atEdge = loc.y >= f.maxY - 1     // 下边缘 = y 最大
-        }
+        let atEdge = ScreenLayout.hitsEdge(loc, edge: switchEdge,
+                                           desktopBounds: desktopOuterFrame())
 
         // ① 刚交回本机的冷却期内，一律不许再进入远端。
         //    没有这一步会出现"推回来的一瞬间又被判成顶到边缘 → 立刻返回对端"的弹回。
@@ -2985,16 +2985,7 @@ public final class InputController {
     /// NSScreen.frame 是 AppKit 坐标（左下原点），直接和 CGEvent.location 混用会错，
     /// 尤其是边缘判断和 CGWarpMouseCursorPosition（它要求的正是 CG 坐标）。
     private func cgScreenFrames() -> [CGRect] {
-        let screens = NSScreen.screens
-        guard !screens.isEmpty else { return [] }
-        let base = screens.first { $0.frame.origin == .zero } ?? screens[0]
-        let mainH = base.frame.height
-        return screens.map { s in
-            CGRect(x: s.frame.minX,
-                   y: mainH - s.frame.maxY,
-                   width: s.frame.width,
-                   height: s.frame.height)
-        }
+        ScreenLayout.currentScreenFramesCG()
     }
 
     /// 光标所在的那块屏幕（多显示器时用它判断真实的屏幕边界），返回 CG 坐标。
@@ -3003,6 +2994,15 @@ public final class InputController {
         for f in frames where f.contains(loc) { return f }
         for f in frames where f.contains(lastLocalPoint) { return f }
         return frames.first ?? CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    }
+
+    /// **整块 Mac 桌面**在 CG 坐标下的外接矩形（所有显示器的并集）。
+    ///
+    /// ★★ 出界判定只能用这个，绝不能用"光标所在那块屏" ★★
+    /// 多显示器时内屏之间的接缝**不是**出界点；用"所在屏"会把"往右移进右侧那块屏"
+    /// 误判成"撞到左边缘"而跨到 Windows。完整现场见 `ScreenLayout.hitsEdge` 的注释。
+    private func desktopOuterFrame() -> CGRect {
+        ScreenLayout.desktopBounds(cgScreenFrames())
     }
 
     // MARK: - 坐标映射
@@ -3030,16 +3030,24 @@ public final class InputController {
     }
 
     /// 只打一次屏幕基准，便于事后核对「为什么坐标被钳住」。
+    ///
+    /// ⚠️ 必须把每块屏的**原点**也打出来。旧版本只打宽高（`全部屏幕=[1536x864 / 1728x1117]`），
+    /// 于是 2026-10-06 那次「往右移鼠标却从左边缘跨屏」的事故里，
+    /// 从日志**看不出**内建屏其实被排在主屏**右侧**（x 1536..3264），白白多绕一圈。
     private func logScreenBasisOnce(size: CGSize) {
         guard !Self.screenBasisLogged else { return }
         Self.screenBasisLogged = true
-        let all = NSScreen.screens
-            .map { "\(Int($0.frame.width))x\(Int($0.frame.height))" }
+        let cg = cgScreenFrames()
+        let all = cg
+            .map { "x\(Int($0.minX))..\(Int($0.maxX)) y\(Int($0.minY))..\(Int($0.maxY))" }
             .joined(separator: " / ")
         let nsMain = NSScreen.main.map { "\(Int($0.frame.width))x\(Int($0.frame.height))" } ?? "nil"
+        let outer = desktopOuterFrame()
         diag("[MWB] 坐标基准(主显示器)=\(Int(size.width))x\(Int(size.height))"
-             + "  全部屏幕=[\(all)]  NSScreen.main=\(nsMain)"
-             + (NSScreen.screens.count > 1 ? "  ⚠️ 多屏（副屏不参与跨屏映射）" : ""))
+             + "  屏幕(CG 左上原点)=[\(all)]  NSScreen.main=\(nsMain)"
+             + "  桌面外框=x\(Int(outer.minX))..\(Int(outer.maxX)) y\(Int(outer.minY))..\(Int(outer.maxY))"
+             + (NSScreen.screens.count > 1
+                ? "  ⚠️ 多屏：出界判定按**整块桌面的外边界**，内屏接缝不再触发跨屏" : ""))
     }
 
     private static var screenBasisLogged = false

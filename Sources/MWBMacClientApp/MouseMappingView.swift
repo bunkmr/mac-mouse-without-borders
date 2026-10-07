@@ -34,6 +34,8 @@ enum MouseActionChoice {
     /// 常用组合键：一步可选，省去手打。
     /// 这里**只放跨平台语义一致的**（Ctrl 系），不放 ⌘ 系 —— 用户按 ⌘ 记、
     /// 到了 Windows 却要按 Ctrl，手打一次反而更清楚。本机侧要 ⌘ 的话选"自定义"填 `cmd+c`。
+    ///
+    /// 名字走 `L()`（`name` 是中文原文，键即原文），加新的组合键时记得补翻译表。
     static let commonChords: [(tag: String, name: String)] = [
         ("ctrl+c", "复制 Ctrl+C"),
         ("ctrl+v", "粘贴 Ctrl+V"),
@@ -98,8 +100,8 @@ struct MouseMappingSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if state.mouseBindings.isEmpty {
-                Text("还没有配置任何按键。点下面的「自动捕获」再按一下鼠标上的键即可添加"
-                     + "（左键 / 右键除外）。")
+                Text(L("还没有配置任何按键。点下面的「自动捕获」再按一下鼠标上的键即可添加"
+                       + "（左键 / 右键除外）。"))
                     .font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -114,12 +116,12 @@ struct MouseMappingSection: View {
 
             if !mwbMouseSkipped("capture") {
                 HStack(spacing: 8) {
-                    Button(state.capturingMouseButton ? "正在捕获…" : "自动捕获鼠标按键…") {
+                    Button(state.capturingMouseButton ? L("正在捕获…") : L("自动捕获鼠标按键…")) {
                         state.beginMouseButtonCapture()
                     }
                     .font(.caption)
                     .disabled(state.capturingMouseButton)
-                    .help("点一下，然后按一下鼠标上要配置的那个键（不是键盘）")
+                    .help(L("点一下，然后按一下鼠标上要配置的那个键（不是键盘）"))
 
                     if state.capturingMouseButton {
                         ProgressView().controlSize(.small)
@@ -146,7 +148,7 @@ struct MouseMappingSection: View {
 
             if !mwbMouseSkipped("toggles") {
                 Divider()
-                Toggle("按键号 3/4 互换（后退键被识别成前进时勾选）",
+                Toggle(L("按键号 3/4 互换（后退键被识别成前进时勾选）"),
                        isOn: $state.swapSideButtons)
                     .font(.caption)
                     // 编号口径那段有 5 行，正文放不下（面板可用高度只有 ~624pt），
@@ -154,11 +156,11 @@ struct MouseMappingSection: View {
                     .help(Self.numberingHint)
 
                 Divider()
-                Text("滚轮方向反转（Mac「自然滚动」与 Windows 正负相反，两个方向独立）")
+                Text(L("滚轮方向反转（Mac「自然滚动」与 Windows 正负相反，两个方向独立）"))
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 HStack(spacing: 14) {
-                    Toggle("本机 → Windows", isOn: $state.scrollReverseToRemote).font(.caption)
-                    Toggle("Windows → 本机", isOn: $state.scrollReverseFromRemote).font(.caption)
+                    Toggle(L("本机 → Windows"), isOn: $state.scrollReverseToRemote).font(.caption)
+                    Toggle(L("Windows → 本机"), isOn: $state.scrollReverseFromRemote).font(.caption)
                     Spacer()
                 }
             }
@@ -168,7 +170,18 @@ struct MouseMappingSection: View {
     /// 「编号口径」说明。
     /// 单独拎成静态属性是给 SwiftUI 的表达式瘦身 —— 这段拼接塞在 body 里
     /// 会让类型推断超时（实测 "unable to type-check in reasonable time"）。
+    ///
+    /// 长段散文不走 `L()`（要把整段当中文键太难维护），直接给英文分支。
     static let numberingHint: String = {
+        if Lang.isEnglish {
+            return "Numbering: macOS counts from 0 internally (number 3 = the 4th button, "
+                 + "number 4 = the 5th), while mouse packaging, drivers and Windows call them "
+                 + "\u{201C}Button 4 / Button 5\u{201D}. On most mice \u{201C}Back\u{201D} is physical "
+                 + "button 4, i.e. macOS number 3. A few mice (Razer, some Logitech/white-label) "
+                 + "report the two extra buttons swapped in their HID descriptor — tick this to flip "
+                 + "everything at once; it applies to both capture and Windows injection. Every side-button "
+                 + "press logs both the macOS number and the physical button number."
+        }
         var s = "编号口径：macOS 内部按 0 基计数（号 3 = 第 4 个键、号 4 = 第 5 个键），"
         s += "鼠标包装 / 驱动 / Windows 按 1 基叫「Button 4 / Button 5」。"
         s += "绝大多数鼠标的「后退」= 物理按键 4，也正是 macOS 号 3；"
@@ -214,12 +227,12 @@ private struct MouseButtonCard: View, Equatable {
                     Image(systemName: "trash").font(.system(size: 10))
                 }
                 .buttonStyle(.plain)
-                .help("删除这个按键的配置")
+                .help(L("删除这个按键的配置"))
             }
 
-            gestureRow("点按", mac: \.macTap, win: \.winTap)
-            gestureRow("按住滚动", mac: \.macScroll, win: \.winScroll)
-            gestureRow("按住拖动", mac: \.macDrag, win: \.winDrag)
+            gestureRow(L("点按"), mac: \.macTap, win: \.winTap)
+            gestureRow(L("按住滚动"), mac: \.macScroll, win: \.winScroll)
+            gestureRow(L("按住拖动"), mac: \.macDrag, win: \.winDrag)
         }
         .padding(6)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
@@ -236,17 +249,17 @@ private struct MouseButtonCard: View, Equatable {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .frame(width: 52, alignment: .leading)
-                Text("本机").font(.system(size: 10))
+                Text(L("本机")).font(.system(size: 10))
                 actionPicker(specBinding(mac))
-                Text("远端").font(.system(size: 10))
+                Text(L("远端")).font(.system(size: 10))
                 actionPicker(specBinding(win))
             }
             // 只在选了「自定义组合键…」时才出现的输入框（避免长期占地方）
             if currentSpec(mac).action == .custom {
-                customField("本机 " + title, specBinding(mac))
+                customField(LF("%@ · 本机", title), specBinding(mac))
             }
             if currentSpec(win).action == .custom {
-                customField("远端 " + title, specBinding(win))
+                customField(LF("%@ · 远端", title), specBinding(win))
             }
         }
     }
@@ -271,29 +284,29 @@ private struct MouseButtonCard: View, Equatable {
 
     private func actionPicker(_ spec: Binding<MouseActionSpec>) -> some View {
         Picker("", selection: tagBinding(spec)) {
-            Text("不映射").tag(MouseActionChoice.offTag)
+            Text(L("不映射")).tag(MouseActionChoice.offTag)
 
             ForEach(MouseActionGroup.allCases) { g in
-                Section(g.displayName) {
+                Section(L(g.displayName)) {
                     ForEach(MouseAction.allCases.filter { $0.group == g && $0 != .off && $0 != .custom }) { a in
-                        Text(a.displayName).tag("@" + a.rawValue)
+                        Text(L(a.displayName)).tag("@" + a.rawValue)
                     }
                 }
             }
 
-            Section("常用组合键") {
+            Section(L("常用组合键")) {
                 ForEach(MouseActionChoice.commonChords, id: \.tag) { c in
-                    Text(c.name).tag(c.tag)
+                    Text(L(c.name)).tag(c.tag)
                 }
             }
 
-            Text("自定义组合键…").tag(MouseActionChoice.customTag)
+            Text(L("自定义组合键…")).tag(MouseActionChoice.customTag)
         }
         .labelsHidden()
         .pickerStyle(.menu)
         .frame(maxWidth: 128)
-        .help(MouseActionChoice.hint(for: MouseActionChoice.tag(for: spec.wrappedValue))
-              ?? "该手势在本机 / 远端要执行的动作")
+        .help(L(MouseActionChoice.hint(for: MouseActionChoice.tag(for: spec.wrappedValue))
+               ?? "该手势在本机 / 远端要执行的动作"))
     }
 
     /// Picker 用 String tag，写回时转成 `MouseActionSpec`。
@@ -313,13 +326,15 @@ private struct MouseButtonCard: View, Equatable {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 4) {
                 Text(label).font(.system(size: 10)).foregroundStyle(.secondary)
-                TextField("按右侧按钮捕获，或手打 ctrl+shift+z", text: Binding(
+                TextField(L("按右侧按钮捕获，或手打 ctrl+shift+z"), text: Binding(
                     get: { spec.wrappedValue.custom },
                     set: { spec.wrappedValue.custom = $0 }
                 ))
                 .font(.system(size: 10, design: .monospaced))
                 .textFieldStyle(.roundedBorder)
 
+                // ⚠️ `target` 是捕获引擎用来配对"正在捕获哪一个"的**内部标识**，不是界面文案，
+                //    因此**不参与本地化**（本地化会让同一次捕获在中英切换时配不上对）。
                 ChordCaptureButton(target: "鼠标·" + label) { chord in
                     spec.wrappedValue = MouseActionSpec(.custom, custom: chord)
                 }
@@ -330,12 +345,13 @@ private struct MouseButtonCard: View, Equatable {
                     .font(.system(size: 9))
                     .foregroundStyle(spec.wrappedValue.isActive ? .green : .orange)
                     .help(spec.wrappedValue.isActive
-                          ? "将发送：\(KeyCaptureMap.pretty(spec.wrappedValue.custom))"
-                          : "这套写法解析不出来，此时不会接管该手势（保留原行为）")
+                          ? LF("将发送：%@", KeyCaptureMap.pretty(spec.wrappedValue.custom))
+                          : L("这套写法解析不出来，此时不会接管该手势（保留原行为）"))
             }
             if spec.wrappedValue.isActive {
-                Text("按下去会发送 \(KeyCaptureMap.pretty(spec.wrappedValue.custom))"
-                     + "（线路串 `\(spec.wrappedValue.custom)`）")
+                Text(LF("按下去会发送 %@（线路串 `%@`）",
+                        KeyCaptureMap.pretty(spec.wrappedValue.custom),
+                        spec.wrappedValue.custom))
                     .font(.system(size: 9)).foregroundStyle(.secondary)
             }
         }

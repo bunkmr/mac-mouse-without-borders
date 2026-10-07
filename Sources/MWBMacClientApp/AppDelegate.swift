@@ -31,6 +31,8 @@ private enum K {
     static let standbyWake = "standbyWakeEnabled"
     /// 待机唤醒是否只在插电时生效（默认开：电池时照常深度睡眠）
     static let standbyWakeACOnly = "standbyWakeACOnly"
+    /// 界面语言："system"（跟随系统，默认）/ "zh" / "en"
+    static let lang = "appLanguage"
 }
 
 // ⚠️ 老版本这里有个 `MouseChordOption`（把「后退 / 前进」两个侧键映射成 10 个固定组合键）。
@@ -45,7 +47,14 @@ final class AppState: ObservableObject {
     @Published var portText: String        { didSet { UD.set(portText, forKey: K.port) } }
     @Published var securityKey: String     { didSet { UD.set(securityKey, forKey: K.key) } }
     @Published var machineName: String     { didSet { UD.set(machineName, forKey: K.name) } }
-    @Published var edge: SwitchEdge        { didSet { UD.set(edge.rawValue, forKey: K.edge) } }
+    // ★ 改完**必须即时下发**到正在运行的连接，否则会出「面板显示左、鼠标却还往右跨」这种
+    //   看起来像代码坏了的现象（旧实现只在 connect() 里读一次）。
+    @Published var edge: SwitchEdge {
+        didSet {
+            UD.set(edge.rawValue, forKey: K.edge)
+            applyEdgeToLiveSession()
+        }
+    }
     @Published var remoteW: String         { didSet { UD.set(remoteW, forKey: K.rw) } }
     @Published var remoteH: String         { didSet { UD.set(remoteH, forKey: K.rh) } }
     @Published var filePortText: String    { didSet { UD.set(filePortText, forKey: K.filePort) } }
@@ -57,9 +66,23 @@ final class AppState: ObservableObject {
     /// false = 按对端像素 1:1（需要填对端真实分辨率）。
     @Published var proportionalMapping: Bool { didSet { UD.set(proportionalMapping, forKey: K.proportional) } }
     /// 本机在 MWB 机器矩阵里的槽位："auto"（自动，由 Windows 下发的布局学习）或 "1".."4"。
-    @Published var slotText: String { didSet { UD.set(slotText, forKey: K.slot) } }
+    @Published var slotText: String {
+        didSet {
+            UD.set(slotText, forKey: K.slot)
+            applySlotToLiveSession()
+        }
+    }
     /// 控制 Windows 期间把本机光标钉在屏幕边缘（实测唯一有效的锁定方式）。
     @Published var lockCursorWhileRemote: Bool { didSet { UD.set(lockCursorWhileRemote, forKey: K.lockCursor) } }
+
+    /// 界面语言。**默认跟随系统**（`Lang.systemResolved`：首选语言是 zh* 就中文，其余英文）。
+    /// 改动会即时反映到面板（`@Published` → ContentView 重算 → `L()` 取到新语言）。
+    @Published var appLanguage: AppLanguage {
+        didSet {
+            UD.set(appLanguage.rawValue, forKey: K.lang)
+            Lang.current = appLanguage
+        }
+    }
 
     /// 跨屏待机唤醒（v1.4.3）：屏幕熄了也不让**系统**进入空闲睡眠 ——
     /// 屏幕照常熄灭省电，但 MWB 进程还活着、心跳还在发、包还收得到，
@@ -196,6 +219,22 @@ final class AppState: ObservableObject {
         self.slotText = UD.string(forKey: K.slot) ?? "auto"
         self.lockCursorWhileRemote = UD.object(forKey: K.lockCursor) == nil
             ? true : UD.bool(forKey: K.lockCursor)
+        // 界面语言：默认**跟随系统**。必须在任何界面构建之前写进 `Lang.current`，
+        // 否则第一帧会按默认语言渲染（表现为"闪一下中文才变英文"）。
+        // 注意：init 里给属性赋值**不会**触发 didSet，所以这里要显式同步一次。
+        // ⚠️ 必须经**局部变量**写 `Lang.current`：此处 `self` 还没完全初始化
+        //    （后面还有 standbyWakeEnabled 等一批属性没赋值），直接读 `self.appLanguage` 编译不过。
+        // 调试钩子 `MWB_LANG=zh|en|system` 可**临时**强制界面语言，且**不写回 UserDefaults**
+        // （init 里赋值不触发 didSet），用来离屏渲染中英两张快照做版式对照。
+        // 取不到环境变量时才回落到用户设置。
+        let envLanguage = ProcessInfo.processInfo.environment["MWB_LANG"]
+            .flatMap(AppLanguage.init(rawValue:))
+        let initialLanguage = envLanguage
+            ?? AppLanguage(rawValue: UD.string(forKey: K.lang) ?? "system") ?? .system
+        self.appLanguage = initialLanguage
+        Lang.current = initialLanguage
+        // 有了语言才能确定文案（属性默认值在 init 体之前就求值了，这里补一次）
+        self.statusText = L("未连接")
         // 跨屏待机唤醒：默认**关**（保持历史行为）。开启代价是"插电时系统不再空闲睡眠"，
         // 所以这件事必须由用户自己点头，且默认只在插电时生效。
         self.standbyWakeEnabled = UD.bool(forKey: K.standbyWake)
@@ -231,7 +270,7 @@ final class AppState: ObservableObject {
         // 再取一次文案作为初值：`standbyStatusText` 靠 2s 健康轮询维护，
         // 而离屏渲染 / 刚启动的那一两秒轮询还没跑，界面就会显示硬编码的初值
         // （2026-09-19 离屏渲染截图实测：开关勾着、状态写"已关闭"）。
-        standbyStatusText = StandbyGuard.shared.statusText
+        standbyStatusText = L(StandbyGuard.shared.statusText)
         standbyWakeCount = StandbyGuard.shared.wakeCount
     }
 
@@ -244,6 +283,34 @@ final class AppState: ObservableObject {
             ? "未配置自定义映射"
             : InputController.shared.keyMappingTable.summary
         applyMouseSettings()
+    }
+
+    /// 把「跨越边缘」即时下发到**正在运行**的连接。
+    ///
+    /// 【为什么必须有】旧实现只在 `connect()` 里 `c.preferredEdge = edge`，
+    /// 于是改完方向后**当前会话仍然用旧方向** —— 面板显示一个值、鼠标行为是另一个值，
+    /// 看起来就像"设置根本没生效/代码有 bug"（2026-10-06 用户反馈）。
+    /// 与 `applyMouseSettings()` 一个思路：能即时就即时，别让用户断开重连。
+    /// 现在输入还没接管远端时改也立刻生效（`hasCrossedEdge` 每帧读 `switchEdge`）。
+    func applyEdgeToLiveSession() {
+        guard let c = client else { return }
+        c.preferredEdge = edge
+        c.input.switchEdge = edge
+        appendLog("[MWB] 切换边缘=\(edge.rawValue)（已即时生效，无需重连）")
+    }
+
+    /// 把「本机槽位」下发到运行中的连接。
+    ///
+    /// ⚠️ 槽位是**握手时上报**的（在 `Client.run()` 里参与 MachineID 解析），
+    /// 运行中改不了对端的认知 ⇒ 这里只能：① 更新本机矩阵显示，让面板立刻对上；
+    /// ② 把新值记进 `preferredSlot`，下次重连由它上报。日志里必须说清楚这一点，
+    /// 否则用户会以为"拖了方块却没用"。
+    func applySlotToLiveSession() {
+        guard let c = client else { return }
+        c.preferredSlot = UInt32(slotText)
+        c.matrix.setConfiguredSelfSlot(Int(slotText))
+        appendLog("[MWB] 本机槽位=\(slotText)"
+                  + (slotText == "auto" ? "（由 Windows 下发的布局学习）" : "（面板已更新；对端下次重连才认）"))
     }
 
     /// 把「可编程鼠标键表 + 滚轮方向 + 侧键编号互换」下发到运行时。
@@ -339,8 +406,18 @@ final class AppState: ObservableObject {
 
     // MARK: - 日志
 
-    /// 日志同时落一份到 /tmp/mwb_gui.log，方便从终端 tail 排查
-    private let logFile = URL(fileURLWithPath: "/tmp/mwb_gui.log")
+    /// 日志同时落一份到 /tmp/mwb_gui.log，方便从终端 tail 排查。
+    ///
+    /// ★ **离屏渲染（`MWB_RENDER_PANEL`）会用另一个文件**，绝不碰正式那份 ★
+    ///
+    /// 2026-10-06 踩到：渲染快照时启动的是**完整的第二个 App 实例**，它一启动就走
+    /// 「轮转日志」流程 —— 把 `/tmp/mwb_gui.log` 改名成 `/tmp/mwb_gui.prev.log` 再建新文件。
+    /// 于是**正在运行的那个实例**的日志被整段冲掉（当时拍了中英两张，冲了两次），
+    /// 排查连接问题时打开日志发现"什么都没有"，白绕一大圈。
+    /// 渲染只是个诊断工具，没有任何理由去动正式实例的日志。
+    private let logFile = URL(fileURLWithPath:
+        ProcessInfo.processInfo.environment["MWB_RENDER_PANEL"] != nil
+            ? "/tmp/mwb_render.log" : "/tmp/mwb_gui.log")
     private let logQueue = DispatchQueue(label: "mwb.log.file")
     private static let logTime: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"; return f
@@ -398,13 +475,18 @@ final class AppState: ObservableObject {
     /// 退出前 `sync` 一次（barrier 语义）即可保证最后一波日志完整。
     func flushLog() { logQueue.sync {} }
 
-    /// 启动时轮转日志：旧的一份挪到 `/tmp/mwb_gui.prev.log`（只留一代），再开新日志。
+    /// 启动时轮转日志：旧的一份挪到同名 `.prev`（只留一代），再开新日志。
     ///
     /// 2026-09-14 加：原先启动时直接清空日志，结果一次重启就把用户刚做完的
     /// 「Win→Mac 拖放失败」实测记录整段抹掉，排查只能重来一遍。
+    ///
+    /// ⚠️ `prev` 必须**由 `logFile` 推导**，不能写死 `/tmp/mwb_gui.prev.log`：
+    ///    否则渲染实例（用 `/tmp/mwb_render.log`）一启动照样把**正式实例的上一份日志**
+    ///    删掉又覆盖，等于换了个文件名继续冲掉现场。
     fileprivate func rotateLogOnStart() {
         let fm = FileManager.default
-        let prev = URL(fileURLWithPath: "/tmp/mwb_gui.prev.log")
+        let prev = logFile.deletingPathExtension()
+            .appendingPathExtension("prev.log")
         try? fm.removeItem(at: prev)
         if fm.fileExists(atPath: logFile.path) {
             try? fm.moveItem(at: logFile, to: prev)
@@ -416,7 +498,7 @@ final class AppState: ObservableObject {
 
     func connect() {
         guard let port = UInt16(portText), !host.isEmpty, !securityKey.isEmpty else {
-            statusText = "请先填写 Windows 主机 IP 与安全密钥"
+            statusText = L("请先填写 Windows 主机 IP 与安全密钥")
             return
         }
         // 已在连接中就别再来一次：`run()` 里是秒级的阻塞 I/O，期间用户连点按钮
@@ -425,7 +507,7 @@ final class AppState: ObservableObject {
         guard !connecting else { return }
         axTrusted = AXIsProcessTrusted()
         connecting = true
-        statusText = "连接中…"
+        statusText = L("连接中…")
         clearLog()
 
         // ★ 建新实例前先把旧实例收掉。`MWBClient.run()` 一起就是"常驻"的：
@@ -496,7 +578,7 @@ final class AppState: ObservableObject {
         c.onLinkUp = { [weak self] in
             DispatchQueue.main.async {
                 self?.connected = true
-                self?.statusText = "已重新连接"
+                self?.statusText = L("已重新连接")
                 self?.appendLog("[GUI] 链路已恢复")
             }
         }
@@ -531,7 +613,7 @@ final class AppState: ObservableObject {
                     self.connected = true
                     self.startHealthPolling()
                     self.matrix = c.matrix.snapshot()
-                    self.statusText = "已连接 \(self.peerName)"
+                    self.statusText = LF("已连接 %@", self.peerName)
                     self.appendLog("[GUI] 连接成功")
                 case .failure(let e):
                     // 失败也要显式收：`run()` 已经配过输入端、电源断言持有者等资源。
@@ -539,7 +621,7 @@ final class AppState: ObservableObject {
                     c.connection.close()
                     self.client = nil
                     self.connected = false
-                    self.statusText = "连接失败: \(e)"
+                    self.statusText = LF("连接失败: %@", "\(e)")
                     self.appendLog("[GUI] 连接失败: \(e)")
                 }
             }
@@ -562,7 +644,7 @@ final class AppState: ObservableObject {
         keyEvents = 0
         matrix = nil
         peerName = ""
-        statusText = "已断开"
+        statusText = L("已断开")
     }
 
     /// 退出 App。
@@ -593,7 +675,7 @@ final class AppState: ObservableObject {
                 //    ★ 依旧遵守「值变才发」：`@Published` 一写整个面板就重算一次，
                 //      这条纪律是 2026-09-17 那次 CPU 飙高的直接教训。
                 //    （Timer 装在主 RunLoop 上，回调即主线程，可直接写。）
-                let st = StandbyGuard.shared.statusText
+                let st = L(StandbyGuard.shared.statusText)
                 if self.standbyStatusText != st { self.standbyStatusText = st }
                 let wc = StandbyGuard.shared.wakeCount
                 if self.standbyWakeCount != wc { self.standbyWakeCount = wc }
@@ -755,6 +837,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 状态变化时刷新菜单栏图标
         state.$connected.sink { [weak self] on in
             DispatchQueue.main.async { self?.statusItem?.button?.image = self?.menuIcon(on) }
+        }.store(in: &cancellables)
+
+        // 界面语言一变就重建主菜单 —— NSMenuItem 的标题是**建好那一刻**取的值，
+        // 不重建的话切了语言菜单还是旧语言（面板本身靠 @Published 自动重算）。
+        // 顺带把已经打开的日志窗口标题也换掉。
+        state.$appLanguage.sink { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.installMainMenu()
+                self.logWindow?.title = L("MWB 运行日志")
+            }
         }.store(in: &cancellables)
 
         // 启动日志每次重开。⚠️ 但**不能直接清空** —— 2026-09-14 踩过这个坑：
@@ -1046,19 +1139,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let appItem = NSMenuItem()
         mainMenu.addItem(appItem)
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "关于 MWB",
+        appMenu.addItem(withTitle: L("关于 MWB"),
                         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                         keyEquivalent: "")
         appMenu.addItem(.separator())
-        let quit = NSMenuItem(title: "退出 MWB", action: #selector(quitApp(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: L("退出 MWB"), action: #selector(quitApp(_:)), keyEquivalent: "q")
         quit.target = self
         appMenu.addItem(quit)
         appItem.submenu = appMenu
         // 「查看日志」也挂到主菜单，方便 ⌘L 打开独立日志窗口
         let viewItem = NSMenuItem()
         mainMenu.addItem(viewItem)
-        let viewMenu = NSMenu(title: "视图")
-        let logsItem = NSMenuItem(title: "查看日志", action: #selector(showLogWindow(_:)), keyEquivalent: "l")
+        let viewMenu = NSMenu(title: L("视图"))
+        let logsItem = NSMenuItem(title: L("查看日志"), action: #selector(showLogWindow(_:)), keyEquivalent: "l")
         logsItem.target = self
         viewMenu.addItem(logsItem)
         viewItem.submenu = viewMenu
@@ -1067,22 +1160,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func showContextMenu(from btn: NSStatusBarButton) {
         let menu = NSMenu()
-        let toggle = NSMenuItem(title: state.connected ? "断开连接" : "连接到 Windows",
+        let toggle = NSMenuItem(title: state.connected ? L("断开连接") : L("连接到 Windows"),
                                 action: #selector(ctxToggleConnect(_:)), keyEquivalent: "")
         toggle.target = self
         toggle.isEnabled = !state.connecting
         menu.addItem(toggle)
         menu.addItem(.separator())
-        let logs = NSMenuItem(title: "查看日志…", action: #selector(showLogWindow(_:)), keyEquivalent: "l")
+        let logs = NSMenuItem(title: L("查看日志…"), action: #selector(showLogWindow(_:)), keyEquivalent: "l")
         logs.target = self
         menu.addItem(logs)
-        let selfTest = NSMenuItem(title: "光标锁定自检（6 秒）",
+        let selfTest = NSMenuItem(title: L("光标锁定自检（6 秒）"),
                                   action: #selector(ctxCursorSelfTest(_:)), keyEquivalent: "")
         selfTest.target = self
         selfTest.isEnabled = !state.connected
         menu.addItem(selfTest)
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "退出 MWB", action: #selector(quitApp(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: L("退出 MWB"), action: #selector(quitApp(_:)), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: btn.bounds.minY - 4), in: btn)
@@ -1112,7 +1205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 440),
                          styleMask: [.titled, .closable, .resizable, .miniaturizable],
                          backing: .buffered, defer: false)
-        w.title = "MWB 运行日志"
+        w.title = L("MWB 运行日志")
         w.isReleasedWhenClosed = false
         w.contentViewController = NSHostingController(
             rootView: MWBLogView(state: state))

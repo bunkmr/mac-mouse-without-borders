@@ -19,9 +19,14 @@
 // 2026-09-17 那次「打开面板 CPU 猛涨到 40%」的根因正是「轮询 → 全面板重算 → 下拉菜单重建」，
 // 页签从结构上把这条路径切断了。相关修复（`MouseButtonCard.equatable()`、
 // 日志合并发布）也仍然保留，两道保险。
+//
+// 【2026-10-06 改版】「屏幕方位 / 机器矩阵 / 本机槽位」三处控件合并成一张
+// **可拖动的「屏幕布局」棋盘** —— 它们本来是同一件事（几台机器怎么摆）却占了三块地方。
+// 见 `screenLayoutSection`。
 
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import MWBMacClientCore
 
 /// 面板页签：按「用户脑子里的同一件事」分组。
@@ -35,10 +40,10 @@ enum PanelTab: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .basics:   return "基础设置"
-        case .transfer: return "文件传输"
-        case .keys:     return "键盘映射"
-        case .help:     return "日志和帮助"
+        case .basics:   return L("基础设置")
+        case .transfer: return L("文件传输")
+        case .keys:     return L("键盘映射")
+        case .help:     return L("日志和帮助")
         }
     }
 }
@@ -72,6 +77,10 @@ struct ContentView: View {
     @State private var activeTab = ContentView.initialTab
     /// 「自定义映射」区块是否展开（离屏自检时要能看到捕获按键）。
     @State private var showKeyMapping = ContentView.expandByDefault
+    /// 「本机方块」是否正在被拖动（用于落点判定与视觉反馈）。
+    @State private var draggingSelfSlot: Int? = nil
+    /// 当前高亮的落点格子（拖到哪一格上面）。
+    @State private var dropTargetSlot: Int? = nil
 
     // MARK: - 「捕获两下写一行」的临时状态
 
@@ -140,13 +149,13 @@ struct ContentView: View {
                 .frame(width: 9, height: 9)
             VStack(alignment: .leading, spacing: 1) {
                 Text("Mouse Without Borders").font(.headline)
-                Text(state.controllingRemote ? "⟶ 正在控制 Windows" : state.statusText)
+                Text(state.controllingRemote ? L("⟶ 正在控制 Windows") : state.statusText)
                     .font(.caption)
                     .foregroundStyle(state.controllingRemote ? .blue : .secondary)
                     .lineLimit(1).truncationMode(.tail)
             }
             Spacer()
-            Button(state.connected ? "断开" : "连接") {
+            Button(state.connected ? L("断开") : L("连接")) {
                 state.connected ? state.disconnect() : state.connect()
             }
             .buttonStyle(.borderedProminent)
@@ -157,7 +166,7 @@ struct ContentView: View {
                 Image(systemName: "power").font(.caption)
             }
             .buttonStyle(.bordered)
-            .help("退出 MWB（也会恢复鼠标光标）")
+            .help(L("退出 MWB（也会恢复鼠标光标）"))
         }
         .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 8)
     }
@@ -193,7 +202,7 @@ struct ContentView: View {
             RoundedRectangle(cornerRadius: 5)
                 .fill(on ? Color.accentColor.opacity(0.13) : Color.clear)
         )
-        .help("\(t.title)（共 \(PanelTab.allCases.count) 页）")
+        .help(LF("%@（共 %d 页）", t.title, PanelTab.allCases.count))
     }
 
     /// 底部固定条。
@@ -205,12 +214,12 @@ struct ContentView: View {
             Button {
                 NSApp.sendAction(#selector(AppDelegate.showLogWindow(_:)), to: nil, from: nil)
             } label: {
-                Label("查看日志", systemImage: "doc.text.magnifyingglass").font(.caption)
+                Label(L("查看日志"), systemImage: "doc.text.magnifyingglass").font(.caption)
             }
             .buttonStyle(.bordered).controlSize(.small)
 
             Spacer()
-            Text("⌘Q 退出").font(.caption2).foregroundStyle(.secondary)
+            Text(L("⌘Q 退出")).font(.caption2).foregroundStyle(.secondary)
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
     }
@@ -236,15 +245,15 @@ struct ContentView: View {
     /// ★ **必须**单独抽成 view、且文案放静态属性：直接内联进 `basicsTab` 的 VStack
     ///   会让那个表达式的类型推断超时 ——
     ///   `error: the compiler is unable to type-check this expression in reasonable time`。
-    ///   诱因是「长字符串字面量 + 多层嵌套 ViewBuilder」。2026-09-17 改版与本次
-    ///   （2026-09-19）都栽在同一处，所以这里刻意拆干净。
+    ///   诱因是「长字符串字面量 + 多层嵌套 ViewBuilder」。2026-09-17 改版与
+    ///   （2026-09-19 / 2026-10-06）都栽在同一处，所以这里刻意拆干净。
     @ViewBuilder
     private var standbyWakeSection: some View {
         Divider()
-        SectionTitle("待机唤醒（屏幕熄灭后仍可被 Windows 键鼠唤醒）")
-        Toggle("屏幕熄灭后仍可被 Windows 鼠标唤醒", isOn: $state.standbyWakeEnabled)
+        SectionTitle(L("待机唤醒（屏幕熄灭后仍可被 Windows 键鼠唤醒）"))
+        Toggle(L("屏幕熄灭后仍可被 Windows 鼠标唤醒"), isOn: $state.standbyWakeEnabled)
             .help(Self.standbyHelp)
-        Toggle("仅在插电时生效（电池时照常深度睡眠）", isOn: $state.standbyWakeACOnly)
+        Toggle(L("仅在插电时生效（电池时照常深度睡眠）"), isOn: $state.standbyWakeACOnly)
             .disabled(!state.standbyWakeEnabled)
             .help(Self.standbyHelpAcOnly)
         HStack(spacing: 8) {
@@ -253,7 +262,7 @@ struct ContentView: View {
             Button {
                 state.runStandbyWakeSelfTest()
             } label: {
-                Label("唤醒自检", systemImage: "sun.max").font(.caption)
+                Label(L("唤醒自检"), systemImage: "sun.max").font(.caption)
             }
             .buttonStyle(.bordered).controlSize(.small)
             .help(Self.standbyHelpTest)
@@ -261,9 +270,9 @@ struct ContentView: View {
     }
 
     private var standbyStatusLine: String {
-        guard state.standbyWakeEnabled else { return "已关闭" }
+        guard state.standbyWakeEnabled else { return L("已关闭") }
         return state.standbyStatusText
-            + (state.standbyWakeCount > 0 ? " · 已唤醒 \(state.standbyWakeCount) 次" : "")
+            + (state.standbyWakeCount > 0 ? LF(" · 已唤醒 %d 次", state.standbyWakeCount) : "")
     }
 
     private static let standbyHelp = """
@@ -284,32 +293,23 @@ struct ContentView: View {
 
     private var basicsTab: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionTitle("Windows 主机")
-            row("IP 地址") {
+            SectionTitle(L("Windows 主机"))
+            row(L("IP 地址")) {
                 TextField("192.168.1.100", text: $state.host).textFieldStyle(.roundedBorder)
             }
-            row("端口 / 密钥") {
+            row(L("端口 / 密钥")) {
                 HStack(spacing: 6) {
                     TextField("15101", text: $state.portText)
                         .frame(width: 60).textFieldStyle(.roundedBorder)
-                    SecureField("配对码", text: $state.securityKey).textFieldStyle(.roundedBorder)
+                    SecureField(L("配对码"), text: $state.securityKey).textFieldStyle(.roundedBorder)
                 }
             }
 
-            Divider()
-            SectionTitle("屏幕方位（Windows 屏幕在本机的哪一侧）")
-            Picker("", selection: $state.edge) {
-                Text("左").tag(SwitchEdge.left)
-                Text("右").tag(SwitchEdge.right)
-                Text("上").tag(SwitchEdge.top)
-                Text("下").tag(SwitchEdge.bottom)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            screenLayoutSection
 
-            // 长说明收进 tooltip（悬停才看），避免占掉面板高度 ——
-            // 这一条说明有 3 行，是「显示不全」的主要元凶之一。
-            Toggle("控制 Windows 时隐藏并锁定本机光标", isOn: $state.lockCursorWhileRemote)
+            Divider()
+            // 长说明收进 tooltip（悬停才看），避免占掉面板高度。
+            Toggle(L("控制 Windows 时隐藏并锁定本机光标"), isOn: $state.lockCursorWhileRemote)
                 .help("开启后鼠标跨到 Windows 时，Mac 上的光标会【隐藏】并把位置钉在屏幕边缘，"
                       + "回到本机时自动恢复显示。"
                       + "隐藏靠 CGDisplayHideCursor（实测有效），退出/断开/紧急热键都会恢复，"
@@ -319,7 +319,7 @@ struct ContentView: View {
                 Button {
                     state.runCursorLockSelfTest()
                 } label: {
-                    Label("锁定自检", systemImage: "scope").font(.caption)
+                    Label(L("锁定自检"), systemImage: "scope").font(.caption)
                 }
                 .buttonStyle(.bordered).controlSize(.small)
                 .disabled(state.connected)
@@ -328,7 +328,7 @@ struct ContentView: View {
                 Button {
                     state.runSwitchSelfTest()
                 } label: {
-                    Label("跨屏自检", systemImage: "arrow.left.arrow.right").font(.caption)
+                    Label(L("跨屏自检"), systemImage: "arrow.left.arrow.right").font(.caption)
                 }
                 .buttonStyle(.bordered).controlSize(.small)
                 .disabled(state.connected)
@@ -340,30 +340,250 @@ struct ContentView: View {
             standbyWakeSection
 
             Divider()
-            matrixSection
-
-            if !mwbAdvSkipped("base") {
-                Divider()
-                SectionTitle("本机")
-                localMachineSection
-            }
+            SectionTitle(L("本机"))
+            localMachineSection
 
             Divider()
-            SectionTitle("连接状态")
+            // ★ 「语言」这一栏**必须双语常显**（不走 L() 翻译）：
+            //   它是"切错了语言的人"唯一的自救入口 —— 全站只有这里不能跟着语言变。
+            //   顺序随当前语言摆动，读起来才自然。
+            SectionTitle(Lang.isEnglish ? "Language / 语言" : "语言 / Language")
+            languageSection
+
+            Divider()
+            SectionTitle(L("连接状态"))
             statusSection
         }
         .padding(12)
     }
 
-    /// 本机身份与坐标映射（原「高级设置」的第一段）。
+    // MARK: - 屏幕布局（合并「屏幕方位 / 机器矩阵 / 本机槽位」）
+
+    /// 棋盘是否 2×2（否则 1×4 一行）。来源是对端下发的 Matrix 包。
+    private var layoutTwoRow: Bool { state.matrix?.twoRow ?? true }
+
+    /// 当前 4 个槽位（没连上时是 4 个空格子）。
+    private var layoutSlots: [MachineSlot] {
+        state.matrix?.slots ?? (1...4).map { MachineSlot(id: $0) }
+    }
+
+    /// 本机占哪个槽。优先用设置里的显式槽位，其次用矩阵学到的，
+    /// 都没有就先摆在 1 号格（**纯展示**，不影响协议 —— 未连接时也得让用户能拖动自己的方块）。
+    private var selfSlotForBoard: Int? {
+        if let t = Int(state.slotText), (1...4).contains(t) { return t }
+        return state.matrix?.selfSlot ?? 1
+    }
+
+    /// 对端（Windows）占哪个槽 —— 取第一个"有名字且不是本机"的槽位。
+    private var peerSlotForBoard: Int? {
+        guard let m = state.matrix else { return nil }
+        return m.slots.first { $0.occupied && $0.name != state.machineName }?.id
+    }
+
+    /// 由相对位置推导出来的滑出方向。
+    private var derivedEdge: (edge: SwitchEdge, guessed: Bool)? {
+        guard let s = selfSlotForBoard, let p = peerSlotForBoard, s != p else { return nil }
+        return ScreenLayout.exitEdge(selfSlot: s, peerSlot: p, twoRow: layoutTwoRow)
+    }
+
+    /// 详情行：说明当前布局是从哪来的。
+    private var layoutHint: String {
+        guard let m = state.matrix else { return L("连接后显示 4 台机器的布局与联机状态") }
+        if !m.receivedMatrix { return LF("在线 %d 台 · 还没收到 Windows 下发的布局", m.onlineCount) }
+        let slot = selfSlotForBoard.map(String.init) ?? "?"
+        if let d = derivedEdge {
+            let dir = Self.edgeName(d.edge)
+            return LF("在线 %d 台 · 本机槽位 %@", m.onlineCount, slot)
+                + " · " + (d.guessed
+                    ? LF("Windows 位于对角，按「%@」推测", dir)
+                    : LF("Windows 在「%@」侧", dir))
+        }
+        return LF("在线 %d 台 · 本机槽位 %@", m.onlineCount, slot)
+    }
+
+    private static func edgeName(_ e: SwitchEdge) -> String {
+        switch e {
+        case .left:   return L("左")
+        case .right:  return L("右")
+        case .top:    return L("上")
+        case .bottom: return L("下")
+        }
+    }
+
+    /// **合并后的单一控件**：一张可拖动的 2×2 / 1×4 棋盘。
+    ///
+    /// 三处旧控件在这里合一：
+    ///   · 「机器矩阵」→ 就是这张棋盘本身；
+    ///   · 「本机槽位」→ 把**本机方块拖到别的格子**（也可点格子）；
+    ///   · 「屏幕方位」→ 由本机与对端的相对位置**推导**，下方的方向按钮只是它的快捷改法。
+    /// 参考同类软件（Synergy / Barrier / Input Leap）的 "Screens & Links"：
+    /// 方位本就是"图上的相对位置"，不该再单开一个下拉框。
+    private var screenLayoutSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Divider()
+            HStack(spacing: 6) {
+                SectionTitle(L("屏幕布局"))
+                Spacer()
+                if let m = state.matrix, m.receivedMatrix {
+                    Text(m.twoRow ? "2×2" : "1×4")
+                        .font(.system(size: 9)).foregroundStyle(.secondary)
+                    if m.wrap {
+                        Text(L("环绕")).font(.system(size: 9)).foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            boardGrid
+
+            Text(layoutHint)
+                .font(.system(size: 9.5)).foregroundStyle(.secondary)
+                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+
+            edgeRow
+
+            HStack(spacing: 6) {
+                if state.slotText != "auto" {
+                    Button {
+                        state.slotText = "auto"
+                        if let d = derivedEdge { state.edge = d.edge }
+                    } label: {
+                        Label(L("槽位自动（由 Windows 学习）"), systemImage: "arrow.uturn.backward")
+                            .font(.system(size: 10))
+                    }
+                    .buttonStyle(.borderless)
+                    .help(L("布局由 Windows 下发的机器矩阵推导；手动改动会覆盖推导结果。"))
+                }
+                Spacer()
+            }
+        }
+    }
+
+    /// 棋盘本体。格子 = 槽位；本机方块可拖，也可以直接点一下格子把它搬过去。
+    private var boardGrid: some View {
+        let twoRow = layoutTwoRow
+        let cols = twoRow ? 2 : 4
+        let rows = twoRow ? 2 : 1
+        return VStack(spacing: 5) {
+            ForEach(0..<rows, id: \.self) { r in
+                HStack(spacing: 5) {
+                    ForEach(0..<cols, id: \.self) { c in
+                        slotTile(r * cols + c + 1)
+                    }
+                }
+            }
+        }
+    }
+
+    private func slotTile(_ slot: Int) -> some View {
+        let s = layoutSlots[safe: slot - 1]
+        let isSelf = (selfSlotForBoard == slot)
+        let isPeer = (peerSlotForBoard == slot)
+        let occupied = (s?.occupied ?? false) || isSelf
+        let online = s?.online ?? false
+        let dot: Color = isSelf ? .blue : (online ? .green : (isPeer ? .orange : Color.secondary.opacity(0.3)))
+        let name = isSelf ? state.machineName : (s?.name ?? "")
+        let targeted = (dropTargetSlot == slot)
+
+        return VStack(spacing: 2) {
+            HStack(spacing: 3) {
+                Circle().fill(dot).frame(width: 6, height: 6)
+                Text("\(slot)")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                if isSelf {
+                    Text(L("本机")).font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.blue)
+                }
+            }
+            Text(occupied ? name : L("空"))
+                .font(.system(size: 10))
+                .lineLimit(1).truncationMode(.middle)
+                .foregroundStyle(occupied ? Color.primary : Color.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 5).padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 5).fill(dot.opacity(targeted ? 0.22 : 0.09)))
+        .overlay(RoundedRectangle(cornerRadius: 5)
+            .stroke(dot.opacity(targeted ? 0.95 : (isSelf ? 0.65 : 0.28)),
+                    lineWidth: targeted ? 1.6 : 1))
+        .contentShape(Rectangle())
+        .onTapGesture { moveSelf(to: slot) }
+        .onDrag {
+            // 只有本机方块能被拖走 —— 对端在哪个槽是它自己的事，我们改不了。
+            guard isSelf else {
+                return NSItemProvider(object: "mwb-none" as NSString)
+            }
+            draggingSelfSlot = slot
+            return NSItemProvider(object: "mwb-self" as NSString)
+        }
+        .onDrop(of: [UTType.text], isTargeted: Binding(
+            get: { dropTargetSlot == slot },
+            set: { dropTargetSlot = $0 ? slot : (dropTargetSlot == slot ? nil : dropTargetSlot) }
+        )) { providers in
+            guard draggingSelfSlot != nil else { return false }
+            providers.first?.loadObject(ofClass: NSString.self) { obj, _ in
+                DispatchQueue.main.async {
+                    let payload = (obj as? NSString).map(String.init) ?? ""
+                    if payload == "mwb-self" { moveSelf(to: slot) }
+                    draggingSelfSlot = nil
+                    dropTargetSlot = nil
+                }
+            }
+            return true
+        }
+        .help(LF("槽位 %d：%@", slot, occupied ? name : L("空")))
+    }
+
+    /// 把本机搬到某个槽位；若能推导出方向就顺手同步（这就是"拖动即设方位"）。
+    private func moveSelf(to slot: Int) {
+        guard (1...4).contains(slot) else { return }
+        draggingSelfSlot = nil
+        dropTargetSlot = nil
+        guard selfSlotForBoard != slot else { return }
+        state.slotText = "\(slot)"
+        // 对端位置已知 → 立刻按新相对位置刷新滑出方向；未知（未连接）则保持用户当前选择。
+        if let p = peerSlotForBoard, p != slot,
+           let d = ScreenLayout.exitEdge(selfSlot: slot, peerSlot: p, twoRow: layoutTwoRow) {
+            state.edge = d.edge
+        }
+    }
+
+    /// 方位快捷改法（等价于把 Windows 拖到那一侧）。棋盘上移不动对端，所以保留这一行。
+    ///
+    /// 【为什么拆成两行】原先写成一句 `鼠标从本机 [左|右|上|下] 边缘滑出（Windows 在这一侧）`，
+    /// 面板净宽只有 ~324pt，中英两种语言都会把尾巴截掉（`.lineLimit(1)` + `.tail`），
+    /// 而且中英断句位置不同 ⇒ 英文渲染成 "Cursor exits this … edge (Windows is…" 更难看。
+    /// 现在把说明挪到独立一行并允许换行，两种语言都不会被裁。
+    private var edgeRow: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            row(L("跨越边缘")) {
+                Picker("", selection: $state.edge) {
+                    Text(L("左")).tag(SwitchEdge.left)
+                    Text(L("右")).tag(SwitchEdge.right)
+                    Text(L("上")).tag(SwitchEdge.top)
+                    Text(L("下")).tag(SwitchEdge.bottom)
+                }
+                .labelsHidden().pickerStyle(.segmented)
+                .frame(width: 148)
+            }
+            Text(L("鼠标从本机这一侧边缘滑出，Windows 就在那个方向。"))
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: - 本机身份与坐标映射（原「高级设置」的第一段）
+
     @ViewBuilder
     private var localMachineSection: some View {
-        row("本机名称") {
+        row(L("本机名称")) {
             TextField("MacBook-Pro", text: $state.machineName).textFieldStyle(.roundedBorder)
         }
 
         HStack(spacing: 6) {
-            Text("远端分辨率").font(.caption).foregroundStyle(.secondary).frame(width: 84, alignment: .leading)
+            Text(L("远端分辨率")).font(.caption).foregroundStyle(.secondary).frame(width: 84, alignment: .leading)
             TextField("1920", text: $state.remoteW).frame(width: 56).textFieldStyle(.roundedBorder)
             Text("×").foregroundStyle(.secondary)
             TextField("1080", text: $state.remoteH).frame(width: 56).textFieldStyle(.roundedBorder)
@@ -372,41 +592,48 @@ struct ContentView: View {
         .disabled(state.proportionalMapping)
         .opacity(state.proportionalMapping ? 0.4 : 1)
 
-        Toggle("按本机屏幕比例映射（推荐）", isOn: $state.proportionalMapping)
+        Toggle(L("按本机屏幕比例映射（推荐）"), isOn: $state.proportionalMapping)
             .font(.caption)
         Text(state.proportionalMapping
-             ? "协议原生做法：跨过本机整个屏幕宽 = 跨过 Windows 整个屏幕宽，与对端分辨率无关。"
-             : "按对端像素 1:1：填错会让 Windows 光标明显偏快/偏慢。")
+             ? L("协议原生做法：跨过本机整个屏幕宽 = 跨过 Windows 整个屏幕宽，与对端分辨率无关。")
+             : L("按对端像素 1:1：填错会让 Windows 光标明显偏快/偏慢。"))
             .font(.caption2).foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
 
-        row("本机槽位") {
-            Picker("", selection: $state.slotText) {
-                Text("自动").tag("auto")
-                Text("1").tag("1")
-                Text("2").tag("2")
-                Text("3").tag("3")
-                Text("4").tag("4")
-            }
-            .labelsHidden().pickerStyle(.segmented)
-        }
+        Toggle(L("启动后自动连接"), isOn: $state.autoConnect).font(.caption)
+    }
 
-        Toggle("启动后自动连接", isOn: $state.autoConnect).font(.caption)
+    // MARK: - 界面语言
+
+    /// 语言设置。默认**跟随系统**（首选语言是 zh* 就中文，其余英文）。
+    private var languageSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            row(L("界面语言")) {
+                Picker("", selection: $state.appLanguage) {
+                    ForEach(AppLanguage.allCases) { lang in
+                        Text(lang.displayName).tag(lang)
+                    }
+                }
+                .labelsHidden().pickerStyle(.menu).frame(maxWidth: 180)
+            }
+            Text(L("语言切换即时生效。日志内容始终为中文（排查用）。"))
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     // MARK: - ② 文件传输
 
     private var transferTab: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionTitle("文件传输")
-            Toggle("拖文件到屏幕边缘即发送", isOn: $state.dropDockEnabled).font(.caption)
-            Toggle("Finder 复制文件(Cmd+C)自动同步", isOn: $state.clipboardFileEnabled).font(.caption)
-            row("端口") {
-                TextField("自动", text: $state.filePortText)
+            SectionTitle(L("文件传输"))
+            Toggle(L("拖文件到屏幕边缘即发送"), isOn: $state.dropDockEnabled).font(.caption)
+            Toggle(L("Finder 复制文件(Cmd+C)自动同步"), isOn: $state.clipboardFileEnabled).font(.caption)
+            row(L("端口")) {
+                TextField(L("自动"), text: $state.filePortText)
                     .frame(width: 76).textFieldStyle(.roundedBorder)
             }
-            Text("留空 = MWB 原生剪贴板通道（主通道端口-1，即 15100）。"
-                 + "Windows 端用 MWB 自带拖放实现接收，无需额外程序。")
+            Text(L("留空 = MWB 原生剪贴板通道（主通道端口-1，即 15100）。Windows 端用 MWB 自带拖放实现接收，无需额外程序。"))
                 .font(.caption2).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -416,21 +643,20 @@ struct ContentView: View {
             }
 
             Divider()
-            SectionTitle("剪贴板")
-            Toggle("同步图片剪贴板", isOn: $state.clipboardImageEnabled).font(.caption)
-            Text("文本一直同步。图片按 MWB 原生做法传 PNG；超过 1MB 自动改走"
-                 + "「发心跳 → 对端回连拉取」，不必额外设置。")
+            SectionTitle(L("剪贴板"))
+            Toggle(L("同步图片剪贴板"), isOn: $state.clipboardImageEnabled).font(.caption)
+            Text(L("文本一直同步。图片按 MWB 原生做法传 PNG；超过 1MB 自动改走「发心跳 → 对端回连拉取」，不必额外设置。"))
                 .font(.caption2).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("注：>1MB 的图要在「把控制权交回 Windows」的那一刻才会推送，稍等 1~2 秒。")
+            Text(L("注：>1MB 的图要在「把控制权交回 Windows」的那一刻才会推送，稍等 1~2 秒。"))
                 .font(.caption2).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             Divider()
-            SectionTitle("通道")
-            channelRow("控制通道", "TCP 15101 —— 键鼠事件 + 文本剪贴板，变化即推。")
-            channelRow("文件 / 图片", "TCP 15100 —— 独立于控制通道，互不阻塞。")
-            channelRow("接收位置", "由 Windows 端 MWB 决定；实测落在对端「桌面」。")
+            SectionTitle(L("通道"))
+            channelRow(L("控制通道"), L("TCP 15101 —— 键鼠事件 + 文本剪贴板，变化即推。"))
+            channelRow(L("文件 / 图片"), L("TCP 15100 —— 独立于控制通道，互不阻塞。"))
+            channelRow(L("接收位置"), L("图片剪贴板内容直接写进本机剪贴板；其它文件落在「桌面/MouseWithoutBorders/」。"))
         }
         .padding(12)
     }
@@ -449,8 +675,8 @@ struct ContentView: View {
     private var keysTab: some View {
         VStack(alignment: .leading, spacing: 8) {
             if !mwbAdvSkipped("cmd") {
-                SectionTitle("Command 键")
-                row("Command 键") {
+                SectionTitle(L("Command 键"))
+                row(L("Command 键")) {
                     Picker("", selection: $state.commandKeyMode) {
                         ForEach(CommandKeyMode.allCases) { m in
                             Text(m.displayName).tag(m)
@@ -465,8 +691,8 @@ struct ContentView: View {
 
             if !mwbAdvSkipped("mouse") {
                 Divider()
-                SectionTitle("鼠标按键")
-                Text("每个按键可分别设置「点按 / 按住滚动 / 按住拖动」在本机与远端的动作，按键可随时增删。")
+                SectionTitle(L("鼠标按键"))
+                Text(L("每个按键可分别设置「点按 / 按住滚动 / 按住拖动」在本机与远端的动作，按键可随时增删。"))
                     .font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 MouseMappingSection(state: state)
@@ -482,7 +708,7 @@ struct ContentView: View {
 
     /// 文本形式的自定义映射表（每行 `本机 = 远端`），带两下捕获自动落行。
     private var customMappingSection: some View {
-        DisclosureGroup("自定义按键映射（每行 `本机 = 远端`）", isExpanded: $showKeyMapping) {
+        DisclosureGroup(L("自定义按键映射（每行 `本机 = 远端`）"), isExpanded: $showKeyMapping) {
             VStack(alignment: .leading, spacing: 4) {
                 TextEditor(text: $state.keyMappingSpec)
                     .font(.system(size: 10.5, design: .monospaced))
@@ -504,18 +730,16 @@ struct ContentView: View {
                 .padding(.top, 1)
 
                 if !pendingSrc.isEmpty || !pendingDst.isEmpty {
-                    Text("已捕获：\(pendingSrc.isEmpty ? "…" : KeyCaptureMap.pretty(pendingSrc))"
-                         + " = \(pendingDst.isEmpty ? "…" : KeyCaptureMap.pretty(pendingDst))"
-                         + " —— 两边都按完会自动写成一行")
+                    Text(LF("已捕获：%@ = %@ —— 两边都按完会自动写成一行",
+                            pendingSrc.isEmpty ? "…" : KeyCaptureMap.pretty(pendingSrc),
+                            pendingDst.isEmpty ? "…" : KeyCaptureMap.pretty(pendingDst)))
                         .font(.caption2).foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
                 ChordCaptureHint()
 
-                Text("例：`cmd+shift+z = ctrl+y`、`cmd+d = ctrl+d`。"
-                     + "也可以点上面两个「捕获按键」：先按本机要用的组合，再按远端要映射到的组合。"
-                     + "`#` 开头是注释。")
+                Text(L("例：`cmd+shift+z = ctrl+y`、`cmd+d = ctrl+d`。也可以点上面两个「捕获按键」：先按本机要用的组合，再按远端要映射到的组合。`#` 开头是注释。"))
                     .font(.caption2).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Text(state.keyMappingSummary)
@@ -532,39 +756,37 @@ struct ContentView: View {
 
     private var helpTab: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionTitle("日志")
+            SectionTitle(L("日志"))
             HStack(spacing: 8) {
                 Button {
                     NSApp.sendAction(#selector(AppDelegate.showLogWindow(_:)), to: nil, from: nil)
                 } label: {
-                    Label("打开日志窗口", systemImage: "doc.text.magnifyingglass").font(.caption)
+                    Label(L("打开日志窗口"), systemImage: "doc.text.magnifyingglass").font(.caption)
                 }
                 .buttonStyle(.bordered).controlSize(.small)
                 Spacer()
                 Text("⌘L").font(.caption2).foregroundStyle(.secondary)
             }
-            helpBody("日志文件 `/tmp/mwb_gui.log`（上一次 `/tmp/mwb_gui.prev.log`）。"
-                     + "终端里 `tail -f /tmp/mwb_gui.log` 可实时观察。")
-            helpBody("需要逐包级细节时，用 `MWB_VERBOSE=1` 启动，会打印每个鼠标/键盘包的数值。")
+            helpBody(L("日志文件 `/tmp/mwb_gui.log`（上一次 `/tmp/mwb_gui.prev.log`）。终端里 `tail -f /tmp/mwb_gui.log` 可实时观察。"))
+            helpBody(L("需要逐包级细节时，用 `MWB_VERBOSE=1` 启动，会打印每个鼠标/键盘包的数值。"))
 
             Divider()
-            SectionTitle("快速上手")
-            helpLine("1", "本页签左侧「基础设置」里填 Windows 的 IP 与配对码 → 点「连接」。")
-            helpLine("2", "鼠标推到屏幕边缘即跨到 Windows（方位在基础设置里选）。")
-            helpLine("3", "文本、图片、文件剪贴板自动双向同步，无需额外操作。")
-            helpLine("4", "侧键 / 滚轮 / 组合键在「键盘映射」页签里逐项设置。")
+            SectionTitle(L("快速上手"))
+            helpLine("1", L("本页签左侧「基础设置」里填 Windows 的 IP 与配对码 → 点「连接」。"))
+            helpLine("2", L("鼠标推到屏幕边缘即跨到 Windows（方位在基础设置里选）。"))
+            helpLine("3", L("文本、图片、文件剪贴板自动双向同步，无需额外操作。"))
+            helpLine("4", L("侧键 / 滚轮 / 组合键在「键盘映射」页签里逐项设置。"))
 
             Divider()
-            SectionTitle("遇到问题")
-            helpQA("键盘在 Windows 上没反应",
-                   "系统设置 → 隐私与安全性 → 输入监控，勾上 MWB 后「完全退出再重开」"
-                   + "（该权限对已运行进程不即时生效）。授权入口在「基础设置」页签底部。")
-            helpQA("鼠标只能推到屏幕 2/3 处",
-                   "本机接了 Sidecar（随航）副屏时坐标基准会变；断开随航再试。")
-            helpQA("大图片剪贴板传不过去",
-                   "超过 1MB 的图要在把控制权交回 Windows 的那一刻才推送，稍等 1~2 秒。")
-            helpQA("面板里的设置改了没生效",
-                   "除「立刻生效」的开关外，改完请断开再连一次，让对端重新握手。")
+            SectionTitle(L("遇到问题"))
+            helpQA(L("键盘在 Windows 上没反应"),
+                   L("系统设置 → 隐私与安全性 → 输入监控，勾上 MWB 后「完全退出再重开」（该权限对已运行进程不即时生效）。授权入口在「基础设置」页签底部。"))
+            helpQA(L("鼠标只能推到屏幕 2/3 处"),
+                   L("本机接了 Sidecar（随航）副屏时坐标基准会变；断开随航再试。"))
+            helpQA(L("大图片剪贴板传不过去"),
+                   L("超过 1MB 的图要在把控制权交回 Windows 的那一刻才推送，稍等 1~2 秒。"))
+            helpQA(L("面板里的设置改了没生效"),
+                   L("除「立刻生效」的开关外，改完请断开再连一次，让对端重新握手。"))
         }
         .padding(12)
     }
@@ -591,78 +813,6 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 机器矩阵（单行 4 芯片）
-
-    private var matrixSection: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                SectionTitle("机器矩阵（最多 4 台）")
-                Spacer()
-                if let m = state.matrix, m.receivedMatrix {
-                    Text(m.twoRow ? "2×2" : "1×4")
-                        .font(.system(size: 9)).foregroundStyle(.secondary)
-                    if m.wrap {
-                        Text("环绕").font(.system(size: 9)).foregroundStyle(.secondary)
-                    }
-                }
-            }
-
-            HStack(spacing: 5) {
-                ForEach(0..<4, id: \.self) { i in
-                    slotChip(state.matrix?.slots[safe: i], selfSlot: state.matrix?.selfSlot, id: i + 1)
-                }
-            }
-
-            // 没连上时不显示提示行 —— 少一行就少 ~14pt，SectionTitle 已经说明了用途。
-            if let m = state.matrix {
-                Text(matrixHintShort)
-                    .font(.system(size: 9.5)).foregroundStyle(.secondary)
-                    .lineLimit(1).truncationMode(.tail)
-            }
-        }
-    }
-
-    private func slotChip(_ s: MachineSlot?, selfSlot: Int?, id: Int) -> some View {
-        let isSelf = (selfSlot == id)
-        let occupied = s?.occupied ?? false
-        let online = s?.online ?? false
-        let dot: Color = isSelf ? .blue : (online ? .green : (occupied ? .orange : Color.secondary.opacity(0.3)))
-        let name = s?.name ?? ""
-        return VStack(spacing: 2) {
-            HStack(spacing: 3) {
-                Circle().fill(dot).frame(width: 6, height: 6)
-                Text("\(id)")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 0)
-            }
-            Text(occupied ? name : "—")
-                .font(.system(size: 10))
-                .lineLimit(1).truncationMode(.middle)
-                .foregroundStyle(occupied ? Color.primary : Color.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.horizontal, 5).padding(.vertical, 4)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 5).fill(dot.opacity(0.09)))
-        .overlay(RoundedRectangle(cornerRadius: 5).stroke(dot.opacity(isSelf ? 0.65 : 0.28)))
-        .help(tooltip(s, id: id, isSelf: isSelf, online: online, occupied: occupied, name: name))
-    }
-
-    private func tooltip(_ s: MachineSlot?, id: Int, isSelf: Bool, online: Bool,
-                         occupied: Bool, name: String) -> String {
-        var t = "槽位 \(id)：\(occupied ? name : "空")"
-        if isSelf { t += "（本机）" } else if online { t += "（在线）" }
-        else if occupied { t += "（离线）" }
-        return t
-    }
-
-    private var matrixHintShort: String {
-        guard let m = state.matrix else { return "连接后显示 4 台机器的布局与联机状态" }
-        if !m.receivedMatrix { return "在线 \(m.onlineCount) 台 · 还没收到 Windows 下发的布局包" }
-        return "在线 \(m.onlineCount) 台 · 本机槽位 \(m.selfSlot.map(String.init) ?? "?")"
-    }
-
     // MARK: - 状态 / 权限
 
     private var statusSection: some View {
@@ -672,23 +822,23 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "checkmark.shield.fill")
                         .font(.system(size: 10)).foregroundStyle(.green)
-                    Text("键鼠捕获已就绪")
+                    Text(L("键鼠捕获已就绪"))
                         .font(.caption).foregroundStyle(.secondary)
-                    Text("鼠标 \(state.tapEvents) · 键盘 \(state.keyEvents)")
+                    Text(LF("鼠标 %@ · 键盘 %@", "\(state.tapEvents)", "\(state.keyEvents)"))
                         .font(.caption2).foregroundStyle(.secondary)
                     Spacer()
                     Button { state.retryCapture() } label: {
                         Image(systemName: "arrow.clockwise").font(.caption)
                     }
                     .buttonStyle(.bordered).controlSize(.small)
-                    .help("重建事件捕获")
+                    .help(L("重建事件捕获"))
                     .disabled(!state.connected)
                 }
             } else {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.shield.fill")
                         .foregroundStyle(.orange)
-                    Text("事件捕获未建立，键鼠无法跨屏")
+                    Text(L("事件捕获未建立，键鼠无法跨屏"))
                         .font(.caption).fontWeight(.medium)
                     Spacer()
                     Button { state.retryCapture() } label: {
@@ -699,28 +849,28 @@ struct ContentView: View {
                 }
 
                 HStack(spacing: 12) {
-                    permissionChip("辅助功能（鼠标）", ok: state.axTrusted)
-                    permissionChip("输入监控（键盘）", ok: state.inputMonitoringOK)
+                    permissionChip(L("辅助功能（鼠标）"), ok: state.axTrusted)
+                    permissionChip(L("输入监控（键盘）"), ok: state.inputMonitoringOK)
                     Spacer()
-                    Text("鼠标 \(state.tapEvents) · 键盘 \(state.keyEvents)")
+                    Text(LF("鼠标 %@ · 键盘 %@", "\(state.tapEvents)", "\(state.keyEvents)"))
                         .font(.caption2).foregroundStyle(.secondary)
                 }
 
                 // 说明文字压到各一行 —— 之前四行提示把面板顶出了 560pt 上限。
                 if !state.inputMonitoringOK {
-                    Text("「输入监控」未授权：键盘事件会被系统静默丢弃（鼠标不受影响）。")
+                    Text(L("「输入监控」未授权：键盘事件会被系统静默丢弃（鼠标不受影响）。"))
                         .font(.caption2).foregroundStyle(.orange)
                         .lineLimit(1).truncationMode(.tail)
                 } else if state.keyEvents == 0 {
-                    Text("输入监控已授权但没收到键盘事件：敲一下键盘看数字是否增长。")
+                    Text(L("输入监控已授权但没收到键盘事件：敲一下键盘看数字是否增长。"))
                         .font(.caption2).foregroundStyle(.orange)
                         .lineLimit(1).truncationMode(.tail)
                 }
 
                 HStack(spacing: 6) {
-                    Button("授权辅助功能") { state.openAccessibilitySettings() }
+                    Button(L("授权辅助功能")) { state.openAccessibilitySettings() }
                         .font(.caption2).buttonStyle(.bordered)
-                    Button("授权输入监控") { state.openInputMonitoringSettings() }
+                    Button(L("授权输入监控")) { state.openInputMonitoringSettings() }
                         .font(.caption2).buttonStyle(.bordered)
                     Spacer()
                 }
@@ -743,7 +893,13 @@ struct ContentView: View {
 
     private func row(_ title: String, @ViewBuilder _ content: () -> some View) -> some View {
         HStack(spacing: 8) {
-            Text(title).font(.caption).foregroundStyle(.secondary).frame(width: 84, alignment: .leading)
+            // ⚠️ `.fixedSize(horizontal: false, vertical: true)` 不能省：
+            // 标签宽被钉死 84pt，而右侧若是 Picker/TextField 这类"有固有宽度"的控件，
+            // SwiftUI 会宁可把标签**截断**（英文 "Interface language" → "Interface langu…"）
+            // 也不给它第二行的高度。显式放开纵向，让它换行而不是省略。
+            Text(title).font(.caption).foregroundStyle(.secondary)
+                .frame(width: 84, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
             content()
         }
     }

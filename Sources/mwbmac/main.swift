@@ -189,6 +189,41 @@ if args.count > 1 && args[1] == "--input-inject-race-selftest" {
     exit(ok ? 0 : 2)
 }
 
+if args.count > 1 && args[1] == "--clip-origin-selftest" {
+    // 回归 2026-10-06「每复制一次就往桌面扔一张照片」：
+    // Windows 把剪贴板图片当**文件**发（微信输入法会把图片落成临时 PNG），
+    // 我们若按文件落盘，桌面就会被照片塞满。判据 = 来源（剪贴板宣布 vs 拖放）。
+    print("剪贴板接收归类自检（回归「复制一次就往桌面扔照片」）")
+    let ok = ClipboardIntakeSelfTest.run()
+    print("\n结果: \(ok ? "通过" : "失败")")
+    exit(ok ? 0 : 2)
+}
+
+if args.count > 1 && args[1] == "--screen-layout-selftest" {
+    // 合并「屏幕方位 / 机器矩阵 / 本机槽位」三处重复控件后的几何推导。
+    print("屏幕布局推导自检（方位由本机/对端相对槽位推导）")
+    let ok = ScreenLayout.selfTest()
+    print("\n结果: \(ok ? "通过" : "失败")")
+    exit(ok ? 0 : 2)
+}
+
+if args.count > 1 && args[1] == "--edge-region-selftest" {
+    // 用**当前这台机器真实的屏幕排列**验证出界判定。
+    // 回归 2026-10-06「Mac 自己在最右边了，但鼠标还是可以往右穿越」：
+    // 旧判据按"光标所在那块屏"取边界，多显示器时**内屏接缝**被误当成出界点。
+    print("出界判定 · 真机多屏自检（不移动光标、不接管对端）")
+    let ok = ScreenLayout.realMachineEdgeSelfTest()
+    print("\n结果: \(ok ? "通过" : "失败")")
+    exit(ok ? 0 : 2)
+}
+
+if args.count > 1 && args[1] == "--lang-selftest" {
+    print("界面语言翻译表自检（跟随系统 / 简体中文 / English）")
+    let ok = LocalizationSelfTest.run()
+    print("\n结果: \(ok ? "通过" : "失败")")
+    exit(ok ? 0 : 2)
+}
+
 if args.count > 1 && args[1] == "--clip-race-selftest" {
     // 回归 2026-09-19 的 SIGABRT：多连接并发收剪贴板分片 → 共享缓冲堆破坏（free_medium_botch）。
     print("剪贴板分片并发自检（回归「Windows 截图后 App 退出」）")
@@ -198,9 +233,12 @@ if args.count > 1 && args[1] == "--clip-race-selftest" {
 }
 
 if args.count > 1 && args[1] == "--reconnect-backoff-selftest" {
-    // 回归 2026-09-22「对端刚开机就被我们轰死」：退避曾长期封顶 8s 且永不放弃，
-    // 对端离线 9 小时就轰 2400+ 次 —— 对方 MWB 一启动就被连接洪水打进
-    // `too many connections` 自我保护、自行退出（Windows 上弹框、Helper 报错）。
+    // 回归「对端刚开机就被我们轰死」这一族事故（Windows 上 MWB 弹框自己关了 + Mac 连不上）：
+    //   · 2026-09-22：退避长期封顶 8s 且永不放弃，对端离线 9 小时轰 2400+ 次；
+    //   · 2026-10-06：封顶放宽到 60s，但"永不停歇"没改，7.5 小时仍是 590 次，
+    //     照样把刚启动、配置尚未加载完的 MWB 连判 9 个 invalidkey 后打进
+    //     `too many connections` 自我保护退出（用户今早看到的那个弹框）。
+    // ⇒ 判据已从"总次数"升级为「总次数 < 200 **且** 稳态间隔 ≥ 600s」。
     print("重连退避曲线自检（回归「Windows 端 MWB 被连接洪水打进自我保护」）")
     let ok = MWBClient.reconnectBackoffSelfTest()
     print("\n结果: \(ok ? "通过" : "失败")")

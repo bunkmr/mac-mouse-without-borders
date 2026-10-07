@@ -26,6 +26,10 @@
 | **文件拖放（Mac → Windows）** | ✅ | 主通道发 `ClipboardDragDrop(70)`+`ClipboardDragDropOperation(75)`，再补发远端鼠标抬起；对端回连本机 15100 拉文件 |
 | **文件拖放（Windows → Mac）** | ✅ | 对端发拖放信令 → 本机**本地左键抬起**时反向去对端 15100 拉取 → 落 `~/Desktop/MouseWithoutBorders/`，并**自动在 Finder 中打开该目录、选中文件**；2026-09-14 实拖通过（含中文名、Windows 反斜杠路径正确取到文件名） |
 | 边缘投放带 UI | ✅ | 拖文件到屏幕边缘（left/right）松手即发送 |
+| **多显示器出界判定** | ✅ | 判据取**整块桌面的外接矩形**（所有 `NSScreen` 的并集，`ScreenLayout.desktopBounds`），**不是"光标所在那块屏"**；用后者时内屏之间的**接缝**会被当成出界点（回归 2026-10-06「本机已在最右边、鼠标仍能往右穿」）。自检 `mwbmac --edge-region-selftest`（真机屏幕排列，撒 ~3 万探测点 ×4 方向）＋ `--screen-layout-selftest` |
+| **剪贴板图片归类** | ✅ | 按**来源**判定：对端以 `PostAction=Desktop` 宣布的走「文件」落盘；剪贴板通道宣布的图片进内存分支直接进剪贴板（回归 2026-10-06「复制一次就往桌面扔一张照片」，根因是 Windows 侧剪贴板管理器把图片落成临时 PNG、再当作文件发过来）。自检 `mwbmac --clip-origin-selftest` |
+| 界面语言 | ✅ | `AppLanguage{system,zh,en}` + 显式 `L()`/`LF()` 表（键＝中文原文，查不到回退中文）；刻意不用 `.lproj`（SwiftPM 资源包不在 `Bundle.main`）。自检 `mwbmac --lang-selftest` |
+| **重连退避** | ✅ | 阶梯 `0.5/1/2/4/8 → 8 → 30 → 60 → 180 → **600s 稳态（10 分钟）**`。判据三条：对端离线 9 小时 <200 次、稳态 ≥600s、**对端启动窗口(≈10~60s)内撞击 ≤1 次**。回归两起同源事故（2026-09-22：8s 封顶轰 2400 次；2026-10-06：60s 封顶 590 次，把刚启动的 MWB 连判 9 个 `invalidkey` 后打进 `too many connections` 自杀）。自检 `mwbmac --reconnect-backoff-selftest` |
 | Finder 复制即传（Cmd+C） | ✅ | 监听剪贴板文件变化，自动走同一条原生通道 |
 | UI | ✅ | 菜单栏图标 + 极简配置窗（SwiftUI） |
 
