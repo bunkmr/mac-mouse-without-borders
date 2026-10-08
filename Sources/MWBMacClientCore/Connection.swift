@@ -136,7 +136,12 @@ public final class MWBConnection {
         if myID == 0 { myID = UInt32.random(in: 1...UInt32.max - 1) }
         if myID == 255 { myID = 1 }
 
-        log("[连接] socket 就绪; AES key=\(key.prefix(8).map { String(format: "%02x", $0) }.joined())… IV=\(String(decoding: iv, as: UTF8.self))")
+        // ★ IV 用**十六进制**打。以前这里用 `String(decoding: iv, as: UTF8.self)`，
+        //   而 legacyIV 恰好是一串可打印 ASCII，于是日志里显示成 `IV=1844674407370955`
+        //   —— 看上去像个天文数字，排查时极易误读。hex 才是一眼可核对的形态。
+        let keyHex = key.prefix(8).map { String(format: "%02x", $0) }.joined()
+        let ivHex = iv.map { String(format: "%02x", $0) }.joined()
+        log("[连接] socket 就绪; AES key=\(keyHex)… IV=0x\(ivHex)")
 
         // 2) 虚拟 16 字节块：预热 CBC 链（对端也会发，后面接收时要消耗掉）
         let dummy = MWBCrypto.randomBytes(16)
@@ -184,7 +189,7 @@ public final class MWBConnection {
         case .failure:
             log("[握手] ✗ 对端在超时内**没有发送任何数据**（未读到 16 字节预热块）")
             log("[握手]    → 这不是密钥问题。常见原因：① 对端残留了半开会话"
-                + "（我们上次退出时没发 ByeBye）② 对端 MWB 没在运行 ③ 对端 15101 被别的程序占着")
+                + "（我们上次退出时没发 ByeBye）② 对端 MWB 没在运行 ③ 对端 \(port) 被别的程序占着")
             return .failure(.handshakeFailed)
         case .success(let blk):
             _ = dec.decrypt(blk)

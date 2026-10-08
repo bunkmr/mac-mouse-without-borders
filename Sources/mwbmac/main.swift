@@ -233,13 +233,15 @@ if args.count > 1 && args[1] == "--clip-race-selftest" {
 }
 
 if args.count > 1 && args[1] == "--reconnect-backoff-selftest" {
-    // 回归「对端刚开机就被我们轰死」这一族事故（Windows 上 MWB 弹框自己关了 + Mac 连不上）：
+    // 回归三代重连行为（症状一致：Windows 上 MWB 弹框自己关了 + Mac 连不上，或反过来
+    // 「Windows 开了 Mac 老半天不连」）：
     //   · 2026-09-22：退避长期封顶 8s 且永不放弃，对端离线 9 小时轰 2400+ 次；
     //   · 2026-10-06：封顶放宽到 60s，但"永不停歇"没改，7.5 小时仍是 590 次，
-    //     照样把刚启动、配置尚未加载完的 MWB 连判 9 个 invalidkey 后打进
-    //     `too many connections` 自我保护退出（用户今早看到的那个弹框）。
-    // ⇒ 判据已从"总次数"升级为「总次数 < 200 **且** 稳态间隔 ≥ 600s」。
-    print("重连退避曲线自检（回归「Windows 端 MWB 被连接洪水打进自我保护」）")
+    //     照样把刚启动、配置尚未加载完的 MWB 连判 9 个 invalidkey 后打进自我保护退出；
+    //   · 2026-10-08：600s 稳态确实安静，但**太慢** —— 对端开机后最长等 10 分钟。
+    // ⇒ 本版把「探测对端在不在」与「建立连接」拆成两条节奏，判据也随之改为：
+    //     探测间隔 3~5s ／ 对端开机后 ≤10s 恢复 ／ 启动窗口内握手 ≤2 次 ／ 9h 握手 <100 次。
+    print("重连调度自检（探测与建连分离 · 回归「连接洪水打死对端」与「对端开机后久久不连」）")
     let ok = MWBClient.reconnectBackoffSelfTest()
     print("\n结果: \(ok ? "通过" : "失败")")
     exit(ok ? 0 : 2)
@@ -652,7 +654,9 @@ print("连接 \(host):\(port)  name=\(name)  id=\(myID)")
 print("注意: Windows 端 MWB 中登记的机器名必须与上面的 name 完全一致（大小写不敏感，但字符要对）")
 let client = MWBClient(host: host, port: port, securityKey: key, machineName: name, myID: myID)
 
-switch client.run() {
+// CLI 是「连一次」的语义 ⇒ 显式传 false：让"没连上"依然是一个干净的失败返回值。
+// （GUI 走的是 `retryOnFirstFailure: true` —— 首连失败转入后台自动重连，见 Client.run 的说明。）
+switch client.run(retryOnFirstFailure: false) {
 case .success:
     print("已连接。将持续打印收到的包；按 Ctrl+C 退出。")
     RunLoop.main.run()

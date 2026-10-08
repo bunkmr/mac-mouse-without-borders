@@ -24,6 +24,13 @@ public final class MWBClient {
     public var peerID: UInt32 = 0
     public var peerName: String = ""
 
+    /// 当前是否有一条**已通过双向认证**的链路。
+    ///
+    /// ★ 与 `run()` 的返回值**不是一回事**：首连失败时 `run(retryOnFirstFailure: true)`
+    ///   同样返回 `.success`（语义是"客户端已启动"），此时本属性为 `false`。
+    ///   面板要区分「已连接」与「等待对端上线（自动重连中）」，就得读它。
+    public private(set) var linkEstablished = false
+
     /// 矩阵状态变化回调（面板刷新用）。
     public var onMatrixChanged: (() -> Void)?
 
@@ -376,6 +383,10 @@ public final class MWBClient {
         }
         guard !linkDead else { return }
         linkDead = true
+        linkEstablished = false
+        // 本次断链还没试过重连 ⇒ 清掉"上次失败类型"，第一次重连按**探测间隔**快试
+        //（对端可能只是重启了一下，5 秒内就该接回来）。
+        lastConnectError = nil
         // 链路已死：停掉鼠标发送线程，别让它在死 socket 上继续闷头发。
         // （重连成功后 run() 会重新起一条。）
         stopMouseMoveSender()
@@ -391,9 +402,79 @@ public final class MWBClient {
         scheduleReconnect()
     }
 
-    /// 退避重连：0.5s → 1s → 2s → 4s → 8s（封顶）。
-    /// 重连本身是阻塞 I/O（最长连超时 5s + 握手 8s），必须丢到后台线程，
-    /// 否则会把主线程的事件处理和 UI 一起卡住。
+    /// 首次连接就失败 ⇒ 转入重连循环（**不再把整个客户端丢掉**）。
+    ///
+    /// ★ 这是 2026-10-08「Mac 先开机、Windows 后开机 ⇒ Mac 老半天不连」的修复核心。
+    ///   旧实现由 `AppDelegate` 在失败分支直接 `c.stop()`：既**关掉了回连监听**，
+    ///   又让"只由 `handleLinkDead` 触发"的重连循环根本没机会启动（那个入口要求
+    ///   "曾经连上过"）。于是 Mac 会永久躺平 —— 自己不重连、对端也回连不进来，
+    ///   只能手动点一次「连接」。
+    ///   现在把"首连失败"和"运行中断链"统一成同一件事：客户端继续活着，
+    ///   在后台按「探测间隔 / 握手退避」自动接上对端。
+    private func enterReconnectMode(afterFirstFailure error: MWBConnectionError) {
+        lastConnectError = error
+        linkDead = true
+        linkEstablished = false
+        reconnectAttempts = 0
+        handshakeFailStreak = 0
+        reconnectScheduled = false
+        let hint: String
+        switch error {
+        case .connectFailed:
+            hint = "对端主机不可达（未开机 / 不在网 / MWB 未在监听）—— 将以 "
+                + "\(Int(Self.peerProbeInterval))s 间隔做**轻量探测**，对端一上线立即建立连接"
+        case .handshakeFailed:
+            hint = "对端在线但 MWB 尚未就绪 —— 将按握手退避重试"
+                + "（刻意放慢：刚启动的 MWB 被连接洪水撞上会判 invalidkey 并自我保护退出）"
+        default:
+            hint = "将以探测间隔重试"
+        }
+        log("[MWB] ⓘ 首次连接未成功（\(error)）：\(hint)。"
+            + "回连监听**保持开启** —— 对端开机后也可能主动连回来，无需手动点「连接」。")
+        onLinkDown?("等待对端上线（自动重连中）")
+        scheduleReconnect()
+    }
+
+    /// 单次「对端不在线」探测之后，多久再探一次（秒）。
+    ///
+    /// ★★ 把「**检测对端在不在**」与「**建立连接**」拆开，是 2026-10-08 这一版的核心 ★★
+    ///
+    /// 过去的实现只有一个手段（主动 TCP connect + 握手），它同时承担"探测"与"建连"
+    /// 两种职责，于是必然二选一得难看：
+    ///   · 敲得勤 ⇒ 对端刚启动的那 10~60 秒里被撞出一串 `invalidkey`，把它的
+    ///     `too many connections` 自我保护打出来（2026-09-22 / 10-06 两起事故）；
+    ///   · 敲得懒 ⇒ 退避封顶到 600s，对端明明已经开机，我们还要干等最多 10 分钟
+    ///     —— 这正是用户报的「Windows 开了，Mac 老半天不连」。
+    ///
+    /// 拆开之后各用各的节奏：
+    ///   · `connectFailed`（TCP 都连不上：主机不在 / 15101 没人监听）
+    ///     ⇒ SYN 根本到不了对端的 MWB，**对它零成本** ⇒ 可以探得密：5 秒一次，
+    ///       换来"对端一上线，10 秒内就接上"（5s 间隔 + 一次约 5s 的连接超时）。
+    ///   · `handshakeFailed`（TCP 通了 = 对端 accept 了）⇒ 这才**有成本**，
+    ///     交给下面那条 `handshakeFailBackoff` 慢慢来。
+    public static let peerProbeInterval: Double = 5
+
+    /// 握手失败（对端在线但 MWB 未就绪）时按**连续失败次数**递增的退避。
+    ///
+    /// 只服务于"对端在线、15101 也在 accept，但配置还没加载完"这一个场景：
+    /// 此时每一次握手都会被判 `invalidkey` 并计入它的连接数，密集重试会把刚起来的
+    /// MWB 打进 `too many connections` 自我保护（它自己就退出了）。
+    /// 对端启动窗口约 10~60 秒，所以第一次失败等 30s、第二次 60s 就足以跨过窗口，
+    /// 同时把"窗口内撞击次数"压在 2 次以内（离它的阈值 9 还差得远）。
+    public static func handshakeFailBackoff(streak: Int) -> Double {
+        let n = max(1, streak)
+        switch n {
+        case 1...3:  return 30.0
+        case 4...6:  return 60.0
+        case 7...10: return 180.0
+        default:     return 600.0
+        }
+    }
+
+    /// **历史曲线**（v1.4.4 及以前真正在用的退避）：0.5/1/2/4/8 → 8 → 30 → 60 → 180 → 600s。
+    ///
+    /// 现在**不再用它调度** —— 它把"探测"和"建连"混成同一个动作，正是上面说的问题。
+    /// 保留下来只为让自检能做**新旧对照**（把两代曲线的代价摆在一起看）。
     /// 重连退避时长（秒）。**抽成纯函数是为了能被自检盯住** —— 这条曲线直接决定
     /// 「对端整夜离线时会不会被我们轰死」，属于必须可回归的东西。
     ///
@@ -424,93 +505,141 @@ public final class MWBClient {
         }
     }
 
-    /// 重连退避回归自检 —— 判据是「**对端离线一整夜会重试多少次、稳态间隔多长**」。
+    /// 重连调度回归自检 —— 判据从「总次数」升级为「**对端开机后多久接上**」。
     ///
-    /// 回归对象是两起同源事故（症状一模一样：Windows 上 MWB 弹框自己关了 + Mac 连不上）：
-    ///   ① 2026-09-22：Windows 关机 9 小时，退避一直封顶在 8s（每次连接还要 5s 超时），
-    ///      合计轰了 2400+ 次，对端一开机就被打崩；
-    ///   ② 2026-10-06：封顶放宽到 60s，但"永不停歇"这一点没改 —— 7.5 小时仍是 590 次，
-    ///      照样把刚启动的对端 MWB 连判 9 个 invalidkey 后打死。
+    /// 回归对象是三代行为：
+    ///   ① 2026-09-22：曲线封顶 8s 且永不放弃 ⇒ 对端关机 9 小时被敲 2400+ 次，
+    ///      一开机就被打进 `too many connections`（Windows 上 MWB 弹框自己关了）；
+    ///   ② 2026-10-06：封顶放宽到 60s 但密度没变 ⇒ 7.5 小时 590 次，照样把刚启动的 MWB 打死；
+    ///   ③ 2026-10-08：改成 600s 稳态后确实安静了，可**代价是慢** —— 对端开机后最长要等
+    ///      10 分钟才试下一次，用户的观感就是「Windows 开了，Mac 老半天不连」。
     ///
-    /// ⇒ 三条判据：曲线断点正确、9 小时总量 < 200 次、**稳态间隔 ≥ 600s**
-    ///   （只有间隔到分钟级，对端那个 ≈10~60 秒的启动窗口里才"最多只撞 1 次"）。
+    /// ⇒ 本版把「探测」与「建连」拆成两条节奏，判据也随之变成**四件事**：
+    ///     A. 探测间隔 3~5s（够快，又不至于变成刷子）
+    ///     B. **对端开机后 ≤10s 内恢复**（一个探测周期 + 一次连接超时）
+    ///     C. 对端启动窗口（60s）内**握手**次数 ≤2 —— 握手是唯一有成本的动作，对端阈值是 9
+    ///     D. 对端"在线但一直就绪不了"时，9 小时内握手总次数 <100
     public static func reconnectBackoffSelfTest() -> Bool {
         var bad = 0
-        func expect(_ attempt: Int, _ want: Double) {
-            let got = reconnectBackoffDelay(attempt: attempt)
-            if abs(got - want) > 0.001 {
-                print("  ✗ 第 \(attempt) 次: \(got)s，期望 \(want)s"); bad += 1
-            }
+        func check(_ okFlag: Bool, _ desc: String, _ detail: String = "") {
+            print("  \(okFlag ? "✓" : "✗") \(desc)\(detail.isEmpty ? "" : "  —— \(detail)")")
+            if !okFlag { bad += 1 }
         }
-        expect(1, 0.5); expect(2, 1); expect(3, 2); expect(4, 4); expect(5, 8)
-        expect(6, 8); expect(10, 8); expect(11, 30); expect(30, 30)
-        expect(31, 60); expect(60, 60); expect(61, 180); expect(120, 180)
-        expect(121, 600); expect(9999, 600)
 
-        // 量化：按本条曲线跑满 9 小时要重试多少次（+5s ≈ 一次连接超时）。
-        var t = 0.0, n = 1, newCount = 0
-        while t < 32400 { t += reconnectBackoffDelay(attempt: n) + 5; newCount += 1; n += 1 }
-        let v143 = 590                             // 2026-10-06 实测：60s 封顶跑 7.5 小时
-        let v142 = Int(32400 / 13.5)               // 2026-09-22 旧曲线：8s 退避 + 5s 超时
-        let steady = reconnectBackoffDelay(attempt: 100_000)
-        let hitsPerWindow = Int(ceil(60.0 / steady))   // 对端启动窗口 60s 内会撞几次
-        print("  ✓ 曲线 0.5/1/2/4/8 → 8 → 30 → 60 → 180 → **\(Int(steady))s 稳态**")
-        print("    对端离线 9 小时：本版 \(newCount) 次 ｜ 60s 封顶 \(v143) 次（实测）｜ 8s 封顶 \(v142) 次（旧）")
-        print("    稳态间隔 \(Int(steady))s ⇒ 对端启动窗口(≈10~60s)内最多撞 \(hitsPerWindow) 次")
-        if newCount > 200 {
-            print("  ✗ 9 小时仍要重试 \(newCount) 次，过多（判据 <200）"); bad += 1
+        // ── A. 探测间隔
+        check(peerProbeInterval <= 5 && peerProbeInterval >= 3,
+              "对端不在线时的探测间隔 = \(Int(peerProbeInterval))s（判据 3~5s）")
+
+        // ── B. 对端开机后最坏多久接上（一个探测周期 + 一次连接超时，最坏是刚好错过一拍）
+        let connectTimeout = 5.0
+        let recovery = peerProbeInterval + connectTimeout
+        check(recovery <= 10,
+              "对端开机后最坏恢复时间 = \(Int(peerProbeInterval))s 探测 + \(Int(connectTimeout))s 连接超时"
+              + " = \(Int(recovery))s（判据 ≤10s）",
+              "对照：上一代(600s 稳态) 对端开机后最长要等满一整档 = 600s")
+
+        // ── C. 对端启动窗口内会做几次**握手**（唯一有成本的动作）
+        //      模式：探到 TCP 通 → 立即握手 → 失败（窗口内）→ 退避 → 再握手 → …
+        var t = 0.0, streak = 0, handshakesInWindow = 0
+        while t < 60 {
+            handshakesInWindow += 1
+            streak += 1
+            t += handshakeFailBackoff(streak: streak)
         }
-        if steady < 600 {
-            print("  ✗ 稳态间隔只有 \(Int(steady))s，对端启动窗口内会连着撞好几次（判据 ≥600s）"); bad += 1
+        check(handshakesInWindow <= 2,
+              "对端启动窗口(60s)内握手 \(handshakesInWindow) 次（判据 ≤2；对端自我保护阈值是 9）")
+
+        // ── D. 对端"在线但一直就绪不了"：9 小时握手总次数
+        t = 0; streak = 0; var handshakesIn9h = 0
+        while t < 32400 {
+            handshakesIn9h += 1
+            streak += 1
+            t += handshakeFailBackoff(streak: streak) + connectTimeout
         }
-        if hitsPerWindow > 1 {
-            print("  ✗ 启动窗口内会撞 \(hitsPerWindow) 次，凑得满对端的连接数阈值（判据 ≤1）"); bad += 1
-        }
+        var legacy9h = 0
+        t = 0
+        while t < 32400 { t += reconnectBackoffDelay(attempt: legacy9h + 1) + connectTimeout; legacy9h += 1 }
+        check(handshakesIn9h < 100,
+              "对端在线但就绪不了 · 9 小时握手总次数 = \(handshakesIn9h) 次（判据 <100）",
+              "对照：上一代曲线 \(legacy9h) 次（真正的代价在 B：对端开机后它还要等满一整档）")
+
+        // ── 曲线断点（防止有人改错档位）
+        check(handshakeFailBackoff(streak: 1) == 30 && handshakeFailBackoff(streak: 3) == 30
+              && handshakeFailBackoff(streak: 4) == 60 && handshakeFailBackoff(streak: 6) == 60
+              && handshakeFailBackoff(streak: 7) == 180 && handshakeFailBackoff(streak: 11) == 600
+              && handshakeFailBackoff(streak: 99) == 600,
+              "握手退避断点：30 / 60 / 180 / 600s")
+
         return bad == 0
     }
 
+    /// 安排下一次重连。**延迟由「上一次失败是谁的错」决定**（见前面两条曲线的说明）：
+    ///
+    ///   · `connectFailed` → `peerProbeInterval`（5s）：对端主机不在 / 15101 没人监听，
+    ///     SYN 到不了 MWB，对它零成本 ⇒ 探得密，换来"对端一上线就接上"。
+    ///   · `handshakeFailed` → `handshakeFailBackoff(streak)`（30/60/180/600s）：
+    ///     对端 accept 了但没就绪，每一次都在它的账上记一笔 ⇒ 必须慢。
+    ///   · 还没失败过（刚断链 / 刚启动）→ 也走 5s：先快速试一次，再按结果分流。
     private func scheduleReconnect() {
         guard !reconnectScheduled else { return }
         reconnectScheduled = true
         reconnectAttempts += 1
-        // 退避：0.5 → 1 → 2 → 4 → 8s（前 5 次）；6~10 次 8s，11~30 次 30s，31~60 次 60s，
-        //       61~120 次 180s，**121 次起 600s（10 分钟）**。
-        //
-        // 【为什么必须把间隔放到分钟级】两起同源事故：
-        //   · 2026-09-22 —— Windows 关机期间我们每 ~13.5s 重连一次，9 小时轰了 2400+ 次；
-        //   · 2026-10-06 —— 封顶放宽到 60s，但"永不停歇"没改，7.5 小时仍是 590 次。
-        // 两次的结果都一样：**对方一开机，MWB 还没把安全码加载完就被这波敲门打进**，
-        // 连续判 `invalidkey`，最终触发它自己的保护 `too many connections` **直接退出** ——
-        // 用户看到的就是「Windows 上 MWB 弹框自己关了 + Helper 报错，Mac 再也连不上」。
-        //
-        // 所以：连接本身对我们没成本，但**对端 MWB 会记连接数**。对端离线越久，
-        // 越要安静下来 —— 慢，才是能连上的前提。
-        let delay = Self.reconnectBackoffDelay(attempt: reconnectAttempts)
-        log("[MWB] [重连] 第 \(reconnectAttempts) 次尝试将在 \(String(format: "%.1f", delay))s 后开始")
+
+        let delay: Double
+        var isHandshakeFail = false
+        if case .some(.handshakeFailed) = lastConnectError {
+            handshakeFailStreak += 1
+            isHandshakeFail = true
+            delay = Self.handshakeFailBackoff(streak: handshakeFailStreak)
+        } else {
+            // 对端压根不在线（或还没失败过）：轻量探测，不对 MWB 造成任何压力。
+            handshakeFailStreak = 0
+            delay = Self.peerProbeInterval
+        }
+
+        log("[MWB] [重连] 第 \(reconnectAttempts) 次尝试将在 \(String(format: "%.1f", delay))s 后开始"
+            + (isHandshakeFail
+               ? "（握手已连续失败 \(handshakeFailStreak) 次 → 放慢：对端 MWB 未就绪时密集敲门"
+                 + "会被它判 invalidkey 并打进自我保护）"
+               : "（对端不在线 → 轻量探测；对端一上线立刻建立连接）"))
         // 长时间连不上时给一条可操作的提示（别让用户对着刷屏日志毫无头绪）。
-        if reconnectAttempts == 20 || reconnectAttempts == 60
-            || reconnectAttempts == 120 || reconnectAttempts % 240 == 0 {
+        if reconnectAttempts == 20 || reconnectAttempts == 120 || reconnectAttempts % 600 == 0 {
             log("[MWB] [重连] ⓘ 已连续重试 \(reconnectAttempts) 次仍未连上。若 Windows 已开机："
                 + "① 确认托盘里有 Mouse Without Borders 且在运行（它有自我保护，可能已自行退出）；"
-                + "② 核对两边安全码一致。本机已转入 \(Int(delay))s 一次的低频探测 —— "
-                + "刻意**不去密集敲门**：对端 MWB 刚启动时配置尚未加载完，被连接洪水撞上会判 "
-                + "invalidkey 并自我保护退出，越快反而越连不上。")
+                + "② 核对两边安全码一致。本机正以 \(Int(Self.peerProbeInterval))s 间隔做轻量探测 —— "
+                + "对端一上线会自动接上，无需手动点「连接」。")
         }
+        // ★ 代际号：`retryNow()` 会把它 +1，用来作废"已经排好但还没到期"的那一次 ——
+        //   否则会出现两次重连并行（两个 socket、两条接收线程）。
+        reconnectGeneration += 1
+        let gen = reconnectGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
+            guard gen == self.reconnectGeneration else { return }   // 已被 retryNow 取代
             guard self.linkDead else { self.reconnectScheduled = false; return }
+            self.reconnectInFlight = true
             DispatchQueue.global(qos: .userInitiated).async {
                 self.armConnectWatchdog(tag: "重连第 \(self.reconnectAttempts) 次")
                 let r = self.connection.reconnect()
                 self.disarmConnectWatchdog()
                 DispatchQueue.main.async {
+                    self.reconnectInFlight = false
+                    // 记下这次失败的类型：**下一次的延迟由它决定**（5s 轻量探测 vs 慢速握手退避）。
+                    if case .failure(let e) = r { self.lastConnectError = e }
                     self.reconnectScheduled = false
                     switch r {
                     case .success:
                         self.linkDead = false
+                        self.linkEstablished = true
+                        self.lastConnectError = nil
                         self.sendFailStreak = 0
                         self.sendFailLogCount = 0
                         self.reconnectAttempts = 0
+                        self.handshakeFailStreak = 0
+                        // ★ 首连就没成功过的话，"运行态"（心跳 / 剪贴板 / 输入捕获 /
+                        //   文件传输 / 接收循环）到现在还一次都没起过 —— run() 里那条路径
+                        //   没走到。这里是它们唯一的启动点（runtimeStarted 守卫保证只做一次）。
+                        self.startRuntimeIfNeeded()
                         self.announceHello()
                         // ★★ 必须重新起一条鼠标发送线程。
                         //
@@ -529,6 +658,31 @@ public final class MWBClient {
                     }
                 }
             }
+        }
+    }
+
+    /// 外部事件（系统从睡眠唤醒 / 网络路径变化 / 用户点「连接」）触发的**立刻重试**：
+    /// 清空退避阶梯，马上试一次。
+    ///
+    /// 【为什么必须有】对端"不在线"期间的探测间隔虽然是 5s，但只要途中撞上过一次
+    /// `handshakeFailed`，退避就会爬到 180~600s 那一档 —— 而"Mac 刚被唤醒 / 网络刚恢复"
+    /// 恰恰是**对端最可能已经就绪**的时刻。此时应当立刻探一次，而不是干等那一档走完。
+    public func retryNow(reason: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.linkDead else { return }
+            // 已经有一轮在飞 → 不必再加一条，它马上会给出结果。
+            guard !self.reconnectInFlight else {
+                self.log("[MWB] [重连] ⚡ 收到「\(reason)」—— 已有一轮尝试在进行，不重复发起")
+                return
+            }
+            self.log("[MWB] [重连] ⚡ 收到「\(reason)」→ 清空退避，立即重试")
+            // 作废"已排好但还没到期"的那一次，否则两个重连会并行。
+            self.reconnectGeneration += 1
+            self.reconnectScheduled = false
+            self.reconnectAttempts = 0
+            self.handshakeFailStreak = 0
+            self.lastConnectError = nil
+            self.scheduleReconnect()
         }
     }
 
@@ -587,6 +741,16 @@ public final class MWBClient {
     /// 是否已排了一次重连（避免重复排队）。
     private var reconnectScheduled = false
     private var reconnectAttempts = 0
+    /// 是否已有一轮重连**正在进行**（`retryNow()` 靠它避免重复发起）。
+    private var reconnectInFlight = false
+    /// 重连代际号：`retryNow()` 把它 +1 来作废"已排好但还没到期"的那一次。
+    private var reconnectGeneration = 0
+    /// 上一次**重连尝试**失败的类型 —— 下一次的延迟由它决定：
+    /// `connectFailed`（对端不在）⇒ 5s 轻量探测；`handshakeFailed`（对端未就绪）⇒ 慢速退避。
+    /// `nil` = 还没失败过（刚断链 / 刚启动）。
+    private var lastConnectError: MWBConnectionError?
+    /// 「握手失败」的连续次数（`connectFailed` 会把它清零）。
+    private var handshakeFailStreak = 0
 
     /// 链路断开 / 恢复回调（GUI 用来更新状态与提示）。
     public var onLinkDown: ((String) -> Void)?
@@ -606,8 +770,23 @@ public final class MWBClient {
                                        machineName: machineName, myID: myID)
     }
 
-    /// 启动客户端。成功返回后，连接与接收循环已在后台运行。
-    public func run() -> Result<Void, MWBConnectionError> {
+    /// 启动客户端。
+    ///
+    /// - Parameter retryOnFirstFailure: 首次连接失败时**不放弃**，转入与「运行中断链」
+    ///   **完全相同**的重连状态机，同时保持回连监听常驻。GUI 用 `true`；CLI 工具传
+    ///   `false`，这样"到底连上没有"仍然是一个干净的返回值。
+    ///
+    ///   ★ 为什么需要这个开关（2026-10-08 用户报「Windows 开机后 Mac 老半天不连」）：
+    ///     旧实现里首次连接失败 = `AppDelegate` 直接 `c.stop()`，于是
+    ///       ① **回连监听被一起关掉**（`lsof` 里连 `:15101 LISTEN` 都没有）；
+    ///       ② 重连循环只由 `handleLinkDead` 触发，而它只在"曾经连上过"之后才可能跑。
+    ///     两条叠加 ⇒ **Mac 先开机、Windows 后开机**这个顺序下 Mac 会永久躺平：
+    ///     自己不重连、对端也回连不进来，只能手点一次「连接」。
+    ///     现在首连失败也进重连循环，且监听不被收 —— 对端一上线，两条路都能自动接上。
+    ///
+    /// - Note: 返回 `.success` 只代表"客户端已启动（监听在跑、重连循环在跑）"，
+    ///   **不代表链路已建立**。要区分二者请读 `linkEstablished`。
+    public func run(retryOnFirstFailure: Bool = true) -> Result<Void, MWBConnectionError> {
         // 握手 + 注册已在此完成
         connection.onLog = { [weak self] s in self?.log("[MWB] \(s)") }
 
@@ -630,17 +809,12 @@ public final class MWBClient {
         // 否则 Windows 侧不会把本机加入机器矩阵（连上后立刻沉默、UI 里看不到本机）。
         startReturnListener(machineID: mid)
 
-        // ★ 起看门狗再连：对端静默时不能无限期挂住（见 armConnectWatchdog 说明）。
-        armConnectWatchdog(tag: "首次连接 \(host):\(port)")
-        let r = connection.connect()
-        guard case .success = r else {
-            disarmConnectWatchdog()
-            log("[MWB] 连接/握手失败: \(r)")
-            return r
-        }
-        disarmConnectWatchdog()
-        log("[MWB] 握手阶段结束，进入运行态")
-
+        // ★★ 连接回调必须在 `connect()` **之前**挂好 ★★
+        //   首连失败时本 Client 会转入重连循环，而重连成功后"收到的包"与"读侧断开信号"
+        //   都依赖这两个闭包 —— 若照旧挂在成功路径上，那条重连链路会**收不到任何包**
+        //   （在 Windows 侧的表现就是对端屏幕上连光标都不出现）。
+        //   它们是纯赋值、不建立任何资源，提前挂没有副作用。
+        //
         // ⚠️ 别强捕获 `connection`：它是 self 的属性，而它自己又持有这个闭包 → 循环引用。
         connection.onPacket = { [weak self] p in
             guard let self else { return }
@@ -652,6 +826,37 @@ public final class MWBClient {
             self?.handleLinkDead(reason)
         }
 
+        // ★ 起看门狗再连：对端静默时不能无限期挂住（见 armConnectWatchdog 说明）。
+        armConnectWatchdog(tag: "首次连接 \(host):\(port)")
+        let r = connection.connect()
+        guard case .success = r else {
+            disarmConnectWatchdog()
+            log("[MWB] 连接/握手失败: \(r)")
+            if retryOnFirstFailure, case .failure(let e) = r {
+                enterReconnectMode(afterFirstFailure: e)
+                // 语义 = "客户端已启动"（监听在跑、重连循环在跑），**不是**"链路已建立"。
+                return .success(())
+            }
+            return r
+        }
+        disarmConnectWatchdog()
+        linkEstablished = true
+        log("[MWB] 握手阶段结束，进入运行态")
+        startRuntimeIfNeeded()
+        connection.startReceiveLoop()
+        return .success(())
+    }
+
+    /// 运行态初始化 —— **只做一次**。
+    ///
+    /// 与 `run()` 从前的内联实现逐句对应，只是搬成了独立函数：现在有**两条路**会走到这里 ——
+    /// ① `run()` 首次连接成功；② 首连失败后，重连循环里**第一次**连上。
+    /// `runtimeStarted` 守卫保证只执行一次：里面全是"起线程 / 起定时器 / 注册观察者"，
+    /// 重复执行就是资源泄漏（多条接收线程、多个心跳定时器、重复的输入捕获……）。
+    private var runtimeStarted = false
+    private func startRuntimeIfNeeded() {
+        guard !runtimeStarted else { return }
+        runtimeStarted = true
         // 主动广播 Hello，让对端把我们加进机器池
         announceHello()
 
@@ -728,9 +933,6 @@ public final class MWBClient {
         // 跨屏文件传输（自建通道 + 边缘投放带 + 剪贴板文件同步）
         configureFileTransfer()
 
-        // 开始接收循环
-        connection.startReceiveLoop()
-
         // 鼠标移动包改由**独立线程**异步发送（信箱只留最新一帧）——
         // 必须在 run() 末尾起：此时连接、密钥、socket 都已就绪。
         startMouseMoveSender()
@@ -739,7 +941,6 @@ public final class MWBClient {
         startMouseSenderSupervisor()
         startFaultInjectionIfRequested()
         startReconnectFaultInjectionIfRequested()
-        return .success(())
     }
 
     // MARK: - 跨屏文件传输

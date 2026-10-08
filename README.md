@@ -63,9 +63,9 @@ Windows 上的「无界鼠标」只能让 Windows 电脑之间互联。这个程
 
 ### 第 1 步：下载
 
-👉 **前往 [Releases 页面](https://github.com/bunkmr/mac-mouse-without-borders/releases/latest) 下载 `MWB-v1.4.4-universal.dmg`**（约 2.4 MB）
+👉 **前往 [Releases 页面](https://github.com/bunkmr/mac-mouse-without-borders/releases/latest) 下载 `MWB-v1.4.5-universal.dmg`**（约 2.4 MB）
 
-也可以直接下仓库里的那份：[dist/MWB-v1.4.4-universal.dmg](dist/MWB-v1.4.4-universal.dmg)。
+也可以直接下仓库里的那份：[dist/MWB-v1.4.5-universal.dmg](dist/MWB-v1.4.5-universal.dmg)。
 
 ### 第 2 步：安装
 
@@ -149,6 +149,25 @@ xattr -dr com.apple.quarantine /Applications/MWB.app
 ---
 
 ## 更新记录
+
+### v1.4.5（2026-10-08）
+
+这一版修掉一个很烦人的问题：**Mac 先开机、Windows 后开机时，Mac 会一直不连**，非得手动点一次「连接」。
+
+- 🐛 **修掉「Windows 开机后 Mac 老半天不连，得手动点一下」**。根因有两个，叠在一起：
+  ① **「探测对端在不在」和「建立连接」以前是同一个动作** —— 每次都完整地敲门＋握手，于是节奏只能二选一：
+  勤一点就把对端敲崩（Windows 上的 MWB 会因连接数过多把自己终止），慢一点（10 分钟一次）又让刚开机的电脑白等很久。
+  ② **首次连接失败就直接放弃了**：既不重试，连「等对端回连」的监听也一起关掉 —— 所以对端后来开机也连不进来。
+
+  现在把两件事彻底拆开：
+  - **对端不在线**（敲门敲不通，对 MWB 零成本）⇒ **每 5 秒轻量探一次**，对端一上线**最慢 10 秒内**自动接上；
+  - **对端在线但还没准备好**（TCP 通了、握手没过，对端会记一笔）⇒ 才放慢到 **30 秒 → 1 分钟 → 3 分钟 → 10 分钟**，
+    既不会把对端敲崩，也不至于等到天荒地老。
+
+  首次连接失败**不再放弃**：转入与「用着用着断线」完全相同的自动重连流程，**回连监听一直开着**。
+  面板上会显示「等待对端上线（自动重连中）」，Windows 开机后自己就接上了，不用再手动点。
+- ✨ **系统从睡眠唤醒、或网络刚恢复时，立刻重试一次**，而不是干等退避时间到。
+- 🔍 日志里握手用的 IV 改成十六进制显示，排查「两边是不是同一把密钥」时更方便对比。
 
 ### v1.4.4（2026-10-06）
 
@@ -403,7 +422,7 @@ no extra software needed on the Windows side.
 
 **Install**
 
-1. Download `dist/MWB-v1.4.4-universal.dmg`
+1. Download `dist/MWB-v1.4.5-universal.dmg`
 2. Drag `MWB.app` into `/Applications`
 3. The app is not notarized, so run once:
    ```bash

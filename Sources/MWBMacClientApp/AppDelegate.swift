@@ -5,6 +5,7 @@ import AppKit
 import SwiftUI
 import Combine
 import Darwin
+import Network
 import SystemConfiguration
 import MWBMacClientCore
 
@@ -609,12 +610,21 @@ final class AppState: ObservableObject {
                 self.connecting = false
                 switch result {
                 case .success:
+                    // ★ 返回 success **不再等于"已连上"**：首连失败时 Client 会转入后台
+                    //   自动重连，同样返回 success（语义 = "客户端已启动"）。真判据是
+                    //   `linkEstablished` —— 否则面板会显示"已连接"，而其实一条链路都没有。
                     self.client = c
-                    self.connected = true
+                    self.connected = c.linkEstablished
                     self.startHealthPolling()
                     self.matrix = c.matrix.snapshot()
-                    self.statusText = LF("已连接 %@", self.peerName)
-                    self.appendLog("[GUI] 连接成功")
+                    if c.linkEstablished {
+                        self.statusText = LF("已连接 %@", self.peerName)
+                        self.appendLog("[GUI] 连接成功")
+                    } else {
+                        self.statusText = L("等待对端上线（自动重连中）")
+                        self.appendLog("[GUI] 尚未连上对端 —— 客户端已在后台自动重连、回连监听保持开启；"
+                                       + "Windows 开机后会自动接上，无需手动点「连接」")
+                    }
                 case .failure(let e):
                     // 失败也要显式收：`run()` 已经配过输入端、电源断言持有者等资源。
                     c.stop()
@@ -626,6 +636,25 @@ final class AppState: ObservableObject {
                 }
             }
         }
+    }
+
+    /// 立刻重试一次连接（**事件驱动**入口）。
+    ///
+    /// 触发源：① 系统从睡眠唤醒；② 网络路径变化（插网线 / 切 WiFi / 从无网恢复）；
+    /// ③ 用户点「连接」。（前两者在 `AppDelegate.wireWakeAndNetworkEvents()` 里订阅。）
+    ///
+    /// 【为什么需要】只要途中撞上过一次 `handshakeFailed`，退避就会爬到 180~600s 那一档；
+    /// 而"刚唤醒 / 网络刚恢复"恰恰是对端最可能已经就绪的时刻 —— 此时应当立刻探一次，
+    /// 而不是干等那一档走完（那正是「Windows 开了，Mac 老半天不连」的观感来源之一）。
+    func retryNow(reason: String) {
+        guard let c = client else {
+            // 还没建立过客户端（例如没开「自动连接」）—— 那就直接连一次。
+            appendLog("[GUI] ⚡ 收到「\(reason)」→ 发起连接")
+            connect()
+            return
+        }
+        appendLog("[GUI] ⚡ 收到「\(reason)」→ 让客户端立刻重试")
+        c.retryNow(reason: reason)
     }
 
     func disconnect() {
@@ -812,6 +841,12 @@ private func extractName(_ s: String) -> String {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let state = AppState()
+
+    /// 网络路径监视器：用于"网络刚恢复"这种时刻立刻重试连接。
+    private var pathMonitor: NWPathMonitor?
+    /// 上一次网络是否可用。只在 **不可用 → 可用** 的跃迁上触发重试，
+    /// 否则同状态的回调（切 WiFi 时会有好几条）会把重试刷成连点。
+    private var lastPathUsable = true
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
 
@@ -857,6 +892,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 立刻把核心层的诊断出口接上：自检/快照等"不连接就跑"的场景没有连接过程，
         // 不在这里兜底的话，那些诊断日志会一行都落不了盘。
         state.wireCoreLogging()
+        // 「系统唤醒 / 网络恢复」→ 立刻重试连接（见 wireWakeAndNetworkEvents 的说明）。
+        wireWakeAndNetworkEvents()
         // 未授权时直接调用系统权限请求 API —— 会弹出官方授权对话框，
         // 用户点「打开系统设置」后系统会**自动把本 app 加入列表**，
         // 比让用户在列表里手动找／手动 + 添加可靠得多。
@@ -1062,6 +1099,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 默认 SIGTERM 会直接终止进程，**不走 applicationWillTerminate** ——
     /// 如果当时正处于「已解耦」状态，用户的光标会推不动，只能注销/重启恢复。
     /// 用 DispatchSourceSignal 把处理搬回主队列执行（信号处理函数里不能调用 CG API）。
+    /// 订阅「系统从睡眠唤醒」与「网络路径变化」，把它们转成一次**立刻重连**。
+    ///
+    /// 【为什么必须有】退避在"对端在线但没就绪"（= 它刚启动）时会爬到 180~600s 那一档，
+    /// 之后哪怕对端已经完全就绪，我们也要干等最多 10 分钟 —— 用户的观感就是
+    /// 「Windows 开了，Mac 老半天不连」。而"Mac 刚被唤醒 / 网络刚恢复"正是最该立刻探一次的时刻。
+    private func wireWakeAndNetworkEvents() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(handleSystemWake(_:)),
+            name: NSWorkspace.didWakeNotification, object: nil)
+
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let usable = (path.status == .satisfied)
+            let was = self.lastPathUsable
+            self.lastPathUsable = usable
+            // 只在「不可用 → 可用」的跃迁上触发，避免同状态的多条回调把重试刷成连点。
+            guard usable, !was else { return }
+            self.state.retryNow(reason: "网络已恢复")
+        }
+        monitor.start(queue: DispatchQueue(label: "mwb.netpath"))
+        pathMonitor = monitor
+    }
+
+    @objc private func handleSystemWake(_ note: Notification) {
+        state.retryNow(reason: "系统已从睡眠唤醒")
+    }
+
     private func installSignalHandlers() {
         for sig in [SIGTERM, SIGINT] {
             let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
@@ -1087,6 +1152,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// 退出时务必恢复「鼠标 → 光标」联动。
     /// 否则 App 在解耦状态被杀掉，用户的光标会推不动，只能注销/重启才能恢复。
     func applicationWillTerminate(_ notification: Notification) {
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         MWBMacClientCore.InputController.shared.releaseCursor()
     }
 

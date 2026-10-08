@@ -29,7 +29,9 @@
 | **多显示器出界判定** | ✅ | 判据取**整块桌面的外接矩形**（所有 `NSScreen` 的并集，`ScreenLayout.desktopBounds`），**不是"光标所在那块屏"**；用后者时内屏之间的**接缝**会被当成出界点（回归 2026-10-06「本机已在最右边、鼠标仍能往右穿」）。自检 `mwbmac --edge-region-selftest`（真机屏幕排列，撒 ~3 万探测点 ×4 方向）＋ `--screen-layout-selftest` |
 | **剪贴板图片归类** | ✅ | 按**来源**判定：对端以 `PostAction=Desktop` 宣布的走「文件」落盘；剪贴板通道宣布的图片进内存分支直接进剪贴板（回归 2026-10-06「复制一次就往桌面扔一张照片」，根因是 Windows 侧剪贴板管理器把图片落成临时 PNG、再当作文件发过来）。自检 `mwbmac --clip-origin-selftest` |
 | 界面语言 | ✅ | `AppLanguage{system,zh,en}` + 显式 `L()`/`LF()` 表（键＝中文原文，查不到回退中文）；刻意不用 `.lproj`（SwiftPM 资源包不在 `Bundle.main`）。自检 `mwbmac --lang-selftest` |
-| **重连退避** | ✅ | 阶梯 `0.5/1/2/4/8 → 8 → 30 → 60 → 180 → **600s 稳态（10 分钟）**`。判据三条：对端离线 9 小时 <200 次、稳态 ≥600s、**对端启动窗口(≈10~60s)内撞击 ≤1 次**。回归两起同源事故（2026-09-22：8s 封顶轰 2400 次；2026-10-06：60s 封顶 590 次，把刚启动的 MWB 连判 9 个 `invalidkey` 后打进 `too many connections` 自杀）。自检 `mwbmac --reconnect-backoff-selftest` |
+| **重连：探测与建连分离** | ✅ | 节奏由**失败类型**决定：`connectFailed`（SYN 到不了 ⇒ 对 MWB **零成本**）走 **5s 轻量探测**，对端一上线最坏 **10s** 内接上；`handshakeFailed`（TCP 通了但没握完手 ⇒ 对端**会记账**）才放慢到 **30/60/180/600s**。判据四条：探测间隔 3~5s、对端开机后最坏恢复 ≤10s、**对端启动窗口(60s)内握手 ≤2 次**、9h 握手 <100 次（实测 62）。回归三起同源事故（2026-09-22：8s 封顶轰 2400 次；2026-10-06：60s 封顶 590 次，把刚启动的 MWB 连判 9 个 `invalidkey` 后打进 `too many connections` 自杀；2026-10-08：节奏太慢 ⇒ 对端开机后老半天不连）。自检 `mwbmac --reconnect-backoff-selftest` |
+| **首连失败不再躺平** | ✅ | `Client.run(retryOnFirstFailure:)` 首次连接失败**不再 `stop()` + `connection.close()`**，转入与「运行中断链」**同一条**重连状态机 ⇒ **回连监听常驻**（旧实现把 `:15101 LISTEN` 也一起关掉，对端后来开机也连不进来）。⚠️ `run()` 返回 `.success` 现在只代表「客户端已启动」，**链路是否建立**改看 `Client.linkEstablished`。回归 2026-10-08「Mac 先开机、Windows 后开机 ⇒ 必须手点一次连接」 |
+| **唤醒 / 网络恢复即时重试** | ✅ | `NSWorkspace.didWakeNotification` ＋ `NWPathMonitor`（只在「不可用 → 可用」**跃迁**上触发，避免同状态反复回调把重试刷成连点）⇒ `retryNow(reason:)` 清空退避阶梯、作废 pending 重试、立刻再试 |
 | Finder 复制即传（Cmd+C） | ✅ | 监听剪贴板文件变化，自动走同一条原生通道 |
 | UI | ✅ | 菜单栏图标 + 极简配置窗（SwiftUI） |
 
