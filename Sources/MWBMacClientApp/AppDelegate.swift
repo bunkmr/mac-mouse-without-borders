@@ -179,6 +179,15 @@ final class AppState: ObservableObject {
     ///   循环同时轰对端，把 Windows 端 MWB 打进自我保护 `too many connections` 自杀。）
     private var connectGeneration = 0
 
+    /// 当前这个 Client 是**按哪一组 主机/端口/密钥**建出来的。
+    ///
+    /// ★ 用途：让 `connect()` 幂等 —— 配置没变时，重复「连接」只当作"立刻重试"，
+    ///   不再拆建一遍（拆建是僵尸客户端的源头，详见 `MWBClient.stopped` 的注释）。
+    ///   2026-10-08 实测：13 次点击 → 12 条僵尸重连循环 → ~2.3 次 TCP connect/秒轰对端。
+    private var builtHost = ""
+    private var builtPort: UInt16 = 0
+    private var builtKey = ""
+
     init() {
         // ★★ 第一件事：忽略 SIGPIPE。
         //   【2026-09-23 事故】上一轮把 I/O 从 CFStream 换成裸 fd 后，丢掉了 CFStream 内建的
@@ -506,6 +515,27 @@ final class AppState: ObservableObject {
         // 会造出多个 MWBClient（各自带一条连接 + 一个重连看门狗 + 一条鼠标发送线程），
         // 一起轰对端 —— 2026-09-22 的事故就是这么触发的。
         guard !connecting else { return }
+
+        // ★★ 幂等：已有客户端在跑（哪怕它正在后台重连）时，别再造一个新的 ★★
+        //
+        // 【为什么】旧行为是"每点一次「连接」就 stop 旧的、再建一个新的"。而 `stop()` 过去
+        //   无法真正停掉旧 Client 已排好的重连（`stop()` 置 `linkDead = true`，恰好是重连块
+        //   的**放行**条件 —— 语义撞车），于是每次点击都留下一条僵尸重连循环。
+        //   2026-10-08 实测：13 次点击 → 12 条僵尸循环，12:25:17→12:30:57 共 **924** 次
+        //   TCP connect 尝试（~2.3 次/秒），计数器一路走到第 85 次。这正是对端
+        //   `too many connections` / `invalidkey` 自我保护的来源，也让"面板显示的那个
+        //   Client"与"真正持有链路的 Client"可能不是一个。
+        //
+        //   两道防线配合：① `MWBClient.stop()` 现在是真终态（`stopped` 标志）；
+        //   ② 这里配置没变就不重建。想强制重建请先点「断开」。
+        if let c = client, host == builtHost, port == builtPort, securityKey == builtKey {
+            appendLog("[GUI] 已有客户端在运行（\(host):\(port)，配置未变）→ 本次「连接」视为**立刻重试**"
+                      + "（不再拆建，避免留下僵尸重连循环）")
+            applyRuntimeSettings()
+            c.retryNow(reason: "用户点「连接」")
+            return
+        }
+
         axTrusted = AXIsProcessTrusted()
         connecting = true
         statusText = L("连接中…")
@@ -533,6 +563,10 @@ final class AppState: ObservableObject {
                   + "；编号互换=\(swapSideButtons ? "开（macOS 号 3↔4）" : "关")")
         appendLog("[GUI] 图片剪贴板同步=\(clipboardImageEnabled ? "开" : "关")")
         let c = MWBClient(host: host, port: port, securityKey: securityKey, machineName: machineName)
+        // 记下这个实例是按哪组配置建的 —— `connect()` 靠它判断"到底要不要重建"。
+        builtHost = host
+        builtPort = port
+        builtKey = securityKey
         c.preferredEdge = edge
         // 位移映射方式：默认按本机屏幕比例（协议原生，与对端分辨率无关）
         c.preferredMotionScale = proportionalMapping ? .proportional : .pixelExact

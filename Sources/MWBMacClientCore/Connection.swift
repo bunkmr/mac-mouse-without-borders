@@ -31,6 +31,21 @@ public final class MWBConnection {
     /// 本机机器 ID（同进程内所有连接共享同一个 ID）。
     public var myID: UInt32
 
+    /// 最近一次握手失败，是不是「**对端一个字节都没回**」造成的。
+    ///
+    /// 【为什么要把这两种握手失败分开】它们的**代价**完全相反，退避节奏也该不同：
+    ///   · `false`（收到了字节，但 magic/checksum 对不上）—— 对端**进程活着**。
+    ///     最常见的是 Windows 的 MWB 刚启动、配置还没加载完，它会回 `invalidkey`。
+    ///     这种情况**每敲一次就在对端连接账上记一笔**，攒够阈值它会
+    ///     `too many connections` 自我保护退出 ⇒ 必须用慢档（30/60/180/600s）。
+    ///   · `true`（预热块超时，零字节）—— **对端进程根本没在处理这条连接**。
+    ///     TCP 之所以连得上，是因为 `listen()` 的 accept 队列由**内核**维护：
+    ///     即使应用从不 `accept()`，`connect()` 也会成功（2026-10-08 实测：
+    ///     Windows 连接待机时 `nc -z 对端IP 15101` 通，但握手 8 秒读不到任何字节）。
+    ///     应用没在处理 ⇒ 也就没有任何"记账"发生 ⇒ 可以放心用**中等**节奏重试，
+    ///     换来"对端一醒来就接上"，而不是干等满 600s 那一档。
+    public private(set) var lastHandshakeSawNoData = false
+
     /// ★ 只用**裸 fd** 做 I/O，不再走 `CFStream`（NSStream）。
     ///
     /// 【为什么必须去掉 CFStream】`CFStreamCreatePairWithSocket` 会**自己再 dup 一份 fd**：
@@ -174,6 +189,7 @@ public final class MWBConnection {
     private func doHandshake() -> Result<Void, MWBConnectionError> {
         setRecvTimeout(seconds: 8)
         defer { setRecvTimeout(seconds: 0) }
+        lastHandshakeSawNoData = false
 
         guard let dec = decryptCtx else { return .failure(.cryptoError(.aesFailed)) }
 
@@ -187,9 +203,13 @@ public final class MWBConnection {
         // 白查了一轮 —— 所以这里必须分开报，并且明确说「这不是密钥问题」。
         switch readRaw(16) {
         case .failure:
+            // ★ 记下"零字节"这个事实：它把这次失败归到"对端进程没在处理"那一类，
+            //   上层的退避会据此走中等档（见 `lastHandshakeSawNoData` 的说明）。
+            lastHandshakeSawNoData = true
             log("[握手] ✗ 对端在超时内**没有发送任何数据**（未读到 16 字节预热块）")
             log("[握手]    → 这不是密钥问题。常见原因：① 对端残留了半开会话"
-                + "（我们上次退出时没发 ByeBye）② 对端 MWB 没在运行 ③ 对端 \(port) 被别的程序占着")
+                + "（我们上次退出时没发 ByeBye）② 对端 MWB 没在运行 ③ 对端 \(port) 被别的程序占着"
+                + " ④ 对端主机进入了睡眠/连接待机（网卡还在、应用被冻结）")
             return .failure(.handshakeFailed)
         case .success(let blk):
             _ = dec.decrypt(blk)
@@ -396,7 +416,7 @@ public final class MWBConnection {
     ///    少了它，「往已被 RST 的 socket 写」不是一次普通的写失败，而是**进程静默死亡**。
     private func applySocketOptions(fd: Int32) {
         Self.applyCoreSocketOptions(fd: fd)
-        log("[连接] socket 选项: TCP_NODELAY=on 写超时=2s 忽略SIGPIPE=on")
+        log("[连接] socket 选项: TCP_NODELAY=on 写超时=2s 忽略SIGPIPE=on keepalive=10s×3")
     }
 
     /// 纯 `setsockopt` 部分（独立成 `static`，好让自检能在真实 socket 上
@@ -411,6 +431,26 @@ public final class MWBConnection {
         withUnsafePointer(to: &tv) { p in
             _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
         }
+
+        // ★ ③ TCP keepalive —— **内核级兜底**，专治「对端主机整个消失」。
+        //
+        // 【它管什么、不管什么】必须分清楚，否则会以为加了它就万事大吉：
+        //   · 管：对端**主机**没了（拔网线、断电、NAT 表项被老化、路由器重启）。
+        //     此时 TCP 重传耗尽后内核会替我们把连接判死，`write()` 才会真的失败。
+        //     默认 keepalive 要 **2 小时**才动，等于没有 —— 必须显式调短。
+        //   · **不管**：对端**主机在、应用冻结**（Windows 连接待机 / MWB 卡死）。
+        //     那种情况下对端内核照常回 keepalive ACK，连接看着完全健康 ——
+        //     这正是 2026-10-08「已连接但鼠标跨不过去」的形态，
+        //     必须靠 `InboundSilence` 那条**应用层**判据来发现。
+        //
+        // 参数：闲置 10s 开始探，每 5s 一颗，连续 3 颗无响应判死 ⇒ 最坏 25s 发现。
+        _ = setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, socklen_t(MemoryLayout<Int32>.size))
+        var idle: Int32 = 10
+        _ = setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, socklen_t(MemoryLayout<Int32>.size))
+        var intvl: Int32 = 5
+        _ = setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, socklen_t(MemoryLayout<Int32>.size))
+        var cnt: Int32 = 3
+        _ = setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, socklen_t(MemoryLayout<Int32>.size))
     }
 
     /// 只设 `SO_NOSIGPIPE`（+ 进程级兜底）。
@@ -726,6 +766,47 @@ public final class MWBConnection {
             let r = getsockopt(probe, SOL_SOCKET, SO_NOSIGPIPE, &v, &len)
             check(r == 0 && v == 1, "socket 级 SO_NOSIGPIPE = 1",
                   "getsockopt 返回 \(r)，读回值 \(v)")
+
+            // ②' TCP keepalive 三件套也读回来验一遍。
+            //     keepalive 是「对端主机整个消失」的**内核级兜底**（应用层冻结那种
+            //     半开连接靠 `InboundSilence` 发现，两者互补，缺一不可）。
+            //     默认 keepalive 要 2 小时才动 —— 没设进去就等于没有，所以必须断言。
+            var ka: Int32 = 0; var l1 = socklen_t(MemoryLayout<Int32>.size)
+            let r1 = getsockopt(probe, SOL_SOCKET, SO_KEEPALIVE, &ka, &l1)
+            // ⚠️ macOS 上 `SO_KEEPALIVE` 的读回值是**选项编号本身（8）**，不是 1。
+            //    实测（Python 同 syscall 标定）：关 = 0，开 = 8 = `SO_KEEPALIVE` 常量。
+            //    所以这里断言 `!= 0`；写 `== 1` 会得到一个假失败，很容易被后人
+            //    "顺手改回去"从而把这个真判据一起删掉。
+            check(r1 == 0 && ka != 0, "socket 级 SO_KEEPALIVE 已开（macOS 读回 \(ka)，关时为 0）",
+                  "getsockopt 返回 \(r1)，读回值 \(ka)")
+            // ★ 阴性对照：读回值必须**跟随设置**，而不是恒等于 8。
+            //   没有这一步，"读回 8" 也可能只是它在回显一个常量。
+            var zero: Int32 = 0
+            _ = setsockopt(probe, SOL_SOCKET, SO_KEEPALIVE, &zero, socklen_t(MemoryLayout<Int32>.size))
+            var kaOff: Int32 = -1; var l1b = socklen_t(MemoryLayout<Int32>.size)
+            let r1b = getsockopt(probe, SOL_SOCKET, SO_KEEPALIVE, &kaOff, &l1b)
+            check(r1b == 0 && kaOff == 0, "关掉后读回 0（阴性对照：读回值确实跟随设置）",
+                  "读回值 \(kaOff)")
+            var kaOn: Int32 = 1
+            _ = setsockopt(probe, SOL_SOCKET, SO_KEEPALIVE, &kaOn, socklen_t(MemoryLayout<Int32>.size))
+
+            var idle: Int32 = 0; var l2 = socklen_t(MemoryLayout<Int32>.size)
+            let r2 = getsockopt(probe, IPPROTO_TCP, TCP_KEEPALIVE, &idle, &l2)
+            check(r2 == 0 && idle > 0 && idle <= 30, "TCP_KEEPALIVE = \(idle)s（判据 1~30s，默认 7200s 等于没有）",
+                  "读回值 \(idle)")
+
+            var iv: Int32 = 0; var l3 = socklen_t(MemoryLayout<Int32>.size)
+            let r3 = getsockopt(probe, IPPROTO_TCP, TCP_KEEPINTVL, &iv, &l3)
+            check(r3 == 0 && iv > 0 && iv <= 30, "TCP_KEEPINTVL = \(iv)s（判据 1~30s）", "读回值 \(iv)")
+
+            var kc: Int32 = 0; var l4 = socklen_t(MemoryLayout<Int32>.size)
+            let r4 = getsockopt(probe, IPPROTO_TCP, TCP_KEEPCNT, &kc, &l4)
+            check(r4 == 0 && kc >= 1 && kc <= 10, "TCP_KEEPCNT = \(kc)（判据 1~10）", "读回值 \(kc)")
+
+            // ②'' 组合出来的最坏发现时间：闲置 + 次数×间隔。用来盯住"别把它调回小时级"。
+            let worst = Double(idle) + Double(kc) * Double(iv)
+            check(worst > 0 && worst <= 60,
+                  "对端主机消失后最坏 \(Int(worst))s 内被内核发现（判据 ≤60s）")
             Darwin.close(probe)
         } else {
             check(false, "socket 级 SO_NOSIGPIPE = 1", "socket() 创建失败（errno=\(errno)）")

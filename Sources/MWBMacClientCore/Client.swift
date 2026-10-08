@@ -382,6 +382,8 @@ public final class MWBClient {
             return
         }
         guard !linkDead else { return }
+        // ★ 已 `stop()` 的 Client 是终态：绝不再把自己拉回链路，也绝不排重连。
+        guard !stopped else { return }
         linkDead = true
         linkEstablished = false
         // 本次断链还没试过重连 ⇒ 清掉"上次失败类型"，第一次重连按**探测间隔**快试
@@ -417,6 +419,7 @@ public final class MWBClient {
         linkEstablished = false
         reconnectAttempts = 0
         handshakeFailStreak = 0
+        handshakeSilentStreak = 0
         reconnectScheduled = false
         let hint: String
         switch error {
@@ -468,6 +471,35 @@ public final class MWBClient {
         case 4...6:  return 60.0
         case 7...10: return 180.0
         default:     return 600.0
+        }
+    }
+
+    /// 「**对端进程没在处理这条连接**」型的握手失败（预热块零字节超时）退避曲线。
+    ///
+    /// ★★ 为什么它敢比 `handshakeFailBackoff` 快一个数量级 ★★
+    ///
+    /// 那两条曲线里"必须慢"的全部理由是**对端会记账**：对端 MWB 收到我们的连接、
+    /// 判定 `invalidkey`，攒到 9 次就打出 `too many connections` 自我保护退出
+    ///（2026-09-22 / 10-06 两起事故）。
+    ///
+    /// 而"零字节超时"这一类的物理含义恰恰是**对端进程没有 accept / 没有读**
+    /// —— 那是内核 accept 队列在替它握手（所以 `connect()` 会成功），
+    /// 应用一字节都没看见，**记账根本无从发生**。典型场景就是
+    /// **Windows 的连接待机（Modern Standby）**：网卡在工作、用户态被冻结。
+    ///
+    /// 实测（2026-10-08 11:15~11:21）：对端在待机窗口里连着 5 次"零字节超时"，
+    /// 全程 TCP 连得上、却 8 秒读不到任何数据；等到 11:21:28 它一醒，
+    /// 立刻就正常握手了。若按 600s 封顶，这一步会白等 10 分钟。
+    ///
+    /// ★ 反过来说：**只要对端回了一个字节，就会落回 `handshakeFailBackoff`** ——
+    ///   真正危险的那种"MWB 正在启动、配置没加载完"必定会回 `invalidkey`，
+    ///   所以安全性一点没让步。
+    public static func handshakeSilentBackoff(streak: Int) -> Double {
+        let n = max(1, streak)
+        switch n {
+        case 1...4:  return 30.0
+        case 5...10: return 60.0
+        default:     return 120.0
         }
     }
 
@@ -570,6 +602,33 @@ public final class MWBClient {
               && handshakeFailBackoff(streak: 99) == 600,
               "握手退避断点：30 / 60 / 180 / 600s")
 
+        // ── E. 零字节型（对端进程没在响应）的退避：必须**更快**，但仍不许无限敲门
+        //
+        //     判据来自 2026-10-08 实测：对端在连接待机窗口里连着 5 次零字节超时，
+        //     醒来后立刻就能握手。若沿用 600s 封顶，这里要白等 10 分钟。
+        var ts = 0.0, sStreak = 0, silentIn9h = 0
+        while ts < 32400 {
+            silentIn9h += 1
+            sStreak += 1
+            ts += handshakeSilentBackoff(streak: sStreak) + connectTimeout
+        }
+        check(handshakeSilentBackoff(streak: 999) <= 120,
+              "零字节型握手失败退避封顶 = \(Int(handshakeSilentBackoff(streak: 999)))s（判据 ≤120s）",
+              "对照：有响应型封顶 600s —— 对端不记账，所以允许更密")
+        check(handshakeSilentBackoff(streak: 999) > 30,
+              "零字节型退避封顶仍 >30s（不许退化成高频敲门）")
+        check(silentIn9h < 300,
+              "零字节型 · 9 小时握手总次数 = \(silentIn9h) 次（判据 <300）",
+              "同一场景下上一代曲线是 \(handshakesIn9h) 次")
+        check(handshakeSilentBackoff(streak: 1) == 30 && handshakeSilentBackoff(streak: 4) == 30
+              && handshakeSilentBackoff(streak: 5) == 60 && handshakeSilentBackoff(streak: 10) == 60
+              && handshakeSilentBackoff(streak: 11) == 120,
+              "零字节型退避断点：30 / 60 / 120s")
+        // ★ 两条曲线在**第一档必须相同**（都是 30s）—— 刚失败一次时还没到"看清楚代价"的时候，
+        //   不应该让代码路径产生行为分叉，否则回归时很难解释。
+        check(handshakeSilentBackoff(streak: 1) == handshakeFailBackoff(streak: 1),
+              "两条曲线第一档一致（都是 30s）")
+
         return bad == 0
     }
 
@@ -581,24 +640,42 @@ public final class MWBClient {
     ///     对端 accept 了但没就绪，每一次都在它的账上记一笔 ⇒ 必须慢。
     ///   · 还没失败过（刚断链 / 刚启动）→ 也走 5s：先快速试一次，再按结果分流。
     private func scheduleReconnect() {
+        // ★ 已 `stop()` ⇒ 永不排队。这是杀掉僵尸循环的第一道闸。
+        guard !stopped else { return }
         guard !reconnectScheduled else { return }
         reconnectScheduled = true
         reconnectAttempts += 1
+        reconnectAttemptsTotal += 1
 
         let delay: Double
-        var isHandshakeFail = false
+        /// 0 = 轻量探测；1 = 有响应的握手失败；2 = 零字节的握手失败。
+        var kind = 0
         if case .some(.handshakeFailed) = lastConnectError {
             handshakeFailStreak += 1
-            isHandshakeFail = true
-            delay = Self.handshakeFailBackoff(streak: handshakeFailStreak)
+            if connection.lastHandshakeSawNoData {
+                // 对端进程没在处理这条连接（连接待机 / 已退出）—— 它没记账，可以用中等档。
+                kind = 2
+                handshakeSilentStreak += 1
+                delay = Self.handshakeSilentBackoff(streak: handshakeSilentStreak)
+            } else {
+                // 对端回了字节但协议/密钥对不上 —— 这种**每次都在它账上记一笔**，必须慢。
+                kind = 1
+                handshakeSilentStreak = 0
+                delay = Self.handshakeFailBackoff(streak: handshakeFailStreak)
+            }
         } else {
             // 对端压根不在线（或还没失败过）：轻量探测，不对 MWB 造成任何压力。
             handshakeFailStreak = 0
+            handshakeSilentStreak = 0
             delay = Self.peerProbeInterval
         }
 
         log("[MWB] [重连] 第 \(reconnectAttempts) 次尝试将在 \(String(format: "%.1f", delay))s 后开始"
-            + (isHandshakeFail
+            + (kind == 2
+               ? "（对端**进程没在响应** —— 预热块零字节超时 \(handshakeSilentStreak) 次；"
+                 + "多半是 Windows 在连接待机/休眠：网卡还在，应用被冻结。"
+                 + "这类连接对端不记账，所以按中等节奏敲门，它一醒来就能接上）"
+               : kind == 1
                ? "（握手已连续失败 \(handshakeFailStreak) 次 → 放慢：对端 MWB 未就绪时密集敲门"
                  + "会被它判 invalidkey 并打进自我保护）"
                : "（对端不在线 → 轻量探测；对端一上线立刻建立连接）"))
@@ -615,7 +692,14 @@ public final class MWBClient {
         let gen = reconnectGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
+            // ★★ 第二道闸，也是本次（2026-10-08 僵尸重连洪水）修复的关键 ★★
+            //    `stop()` 之后到点的重连块**必须**作废。旧代码这里只有下面那条 `linkDead`
+            //    判断，而 `stop()` 恰好把 `linkDead` 置成了 `true` ⇒ 语义撞车，
+            //    僵尸循环正是从这一行溜过去、从此永不停止的。
+            guard !self.stopped else { self.reconnectScheduled = false; return }
             guard gen == self.reconnectGeneration else { return }   // 已被 retryNow 取代
+            // ⚠️ 注意这条判断的**正向**语义：`linkDead == true` 才继续（"链路已断，该重连"）。
+            //    它**不是**"是否已停用"—— 那是 `stopped` 的职责，别再把两者混用。
             guard self.linkDead else { self.reconnectScheduled = false; return }
             self.reconnectInFlight = true
             DispatchQueue.global(qos: .userInitiated).async {
@@ -631,11 +715,15 @@ public final class MWBClient {
                     case .success:
                         self.linkDead = false
                         self.linkEstablished = true
+                        // 重连成功 ⇒ 静默计时归零。不归零的话，看门狗会拿"断链前那次
+                        // 收到包的时刻"来判，刚连上就立刻又被判死，陷入无谓的死循环。
+                        self.lastInboundAt = Date()
                         self.lastConnectError = nil
                         self.sendFailStreak = 0
                         self.sendFailLogCount = 0
                         self.reconnectAttempts = 0
                         self.handshakeFailStreak = 0
+                        self.handshakeSilentStreak = 0
                         // ★ 首连就没成功过的话，"运行态"（心跳 / 剪贴板 / 输入捕获 /
                         //   文件传输 / 接收循环）到现在还一次都没起过 —— run() 里那条路径
                         //   没走到。这里是它们唯一的启动点（runtimeStarted 守卫保证只做一次）。
@@ -670,6 +758,8 @@ public final class MWBClient {
     public func retryNow(reason: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.linkDead else { return }
+            // ★ 已 `stop()` ⇒ 不响应任何"立刻重试"（否则僵尸会借外部事件复活）。
+            guard !self.stopped else { return }
             // 已经有一轮在飞 → 不必再加一条，它马上会给出结果。
             guard !self.reconnectInFlight else {
                 self.log("[MWB] [重连] ⚡ 收到「\(reason)」—— 已有一轮尝试在进行，不重复发起")
@@ -681,6 +771,7 @@ public final class MWBClient {
             self.reconnectScheduled = false
             self.reconnectAttempts = 0
             self.handshakeFailStreak = 0
+            self.handshakeSilentStreak = 0
             self.lastConnectError = nil
             self.scheduleReconnect()
         }
@@ -696,6 +787,46 @@ public final class MWBClient {
     private var sendFailLogCount = 0
     /// 链路是否已被判定为断开（断开期间不再转发输入，等重连）。
     private var linkDead = false
+
+    /// 本 Client 是否已被 `stop()` **永久停用**（终态，不可复活）。
+    ///
+    /// ★★【为什么必须有这个标志 —— 2026-10-08 实测到的僵尸重连洪水】★★
+    /// `stop()` 过去只做了 `linkDead = true` 来隐含表达"用户主动断开、别再自动重连"，
+    /// 但 `scheduleReconnect()` 里那个"延时到点后要不要继续重连"的闸门**恰好**是
+    ///     `guard self.linkDead else { self.reconnectScheduled = false; return }`
+    /// —— 即 `linkDead == true` 是**放行**条件。两处语义撞车，后果是：
+    ///     **`stop()` 不但没停掉待发的重连，反而正好把它放行。**
+    /// 现场证据（`/tmp/mwb_gui.log`，v1.4.6）：
+    ///   · 面板每点一次「连接」就 `connect()` 新建一个 Client，同时 `client?.stop()` 旧的；
+    ///   · 旧 Client 的延时重连块照旧到点执行 → `connection.reconnect()` → 失败 → 再排一次
+    ///     ⇒ **一条永不停止的僵尸重连循环**；
+    ///   · 13 次点击 = 12 条僵尸循环，合计 **~2.3 次 TCP connect/秒**轰对端
+    ///     （12:25:17→12:30:57 共 924 次尝试，计数器走到第 85 次）。
+    /// 这既是对端 `too many connections` / `invalidkey` 自我保护的直接来源，
+    /// 也让"面板显示的那个 Client"和"真正持有链路的 Client"可能不是一个。
+    ///
+    /// ⇒ 一律用这个**独立的终态标志**来判断，不要再借用 `linkDead`。
+    private var stopped = false
+
+    // MARK: - 入站静默看门狗（半开连接的唯一发现手段）
+
+    /// 最近一次收到**任何**入站包的时刻。
+    ///
+    /// 【为什么不能用"最后一次发出鼠标包"之类的信号代替】半开连接的形态是
+    /// 「我们写得出去、对端一个字都不回」，所以判据必须只看**入站**方向。
+    private var lastInboundAt = Date()
+
+    /// 对端静默看门狗（1 秒一跳）。
+    private var inboundSilenceWatchdog: DispatchSourceTimer?
+
+    /// 静默阈值（秒）。`MWB_INBOUND_SILENCE` 可覆盖 —— 自检与现场调参用。
+    private let inboundSilenceTimeout: TimeInterval = {
+        if let s = ProcessInfo.processInfo.environment["MWB_INBOUND_SILENCE"],
+           let v = Double(s), v > 0 {
+            return v
+        }
+        return InboundSilence.defaultTimeout
+    }()
 
     // MARK: - 连接阶段看门狗（2026-09-14 新增）
 
@@ -741,6 +872,14 @@ public final class MWBClient {
     /// 是否已排了一次重连（避免重复排队）。
     private var reconnectScheduled = false
     private var reconnectAttempts = 0
+
+    /// **单调递增**的重连尝试总数 —— 只给自检/诊断用。
+    ///
+    /// 与 `reconnectAttempts`（"连续次数"，成功或 `retryNow` 时会被清零）不同，
+    /// 它只增不减，因此能回答那个关键问题：
+    /// **`stop()` 之后还有没有人在偷偷重连？**
+    /// `--zombie-stop-selftest` 就是靠它在 stop 前后各取一次快照来判定的。
+    public private(set) var reconnectAttemptsTotal = 0
     /// 是否已有一轮重连**正在进行**（`retryNow()` 靠它避免重复发起）。
     private var reconnectInFlight = false
     /// 重连代际号：`retryNow()` 把它 +1 来作废"已排好但还没到期"的那一次。
@@ -751,6 +890,15 @@ public final class MWBClient {
     private var lastConnectError: MWBConnectionError?
     /// 「握手失败」的连续次数（`connectFailed` 会把它清零）。
     private var handshakeFailStreak = 0
+    /// 「对端进程根本没在处理这条连接」的连续次数（预热块**零字节**超时，见
+    /// `MWBConnection.lastHandshakeSawNoData`）。
+    ///
+    /// 【为什么要跟 `handshakeFailStreak` 分开】两者的**代价**是反的：
+    ///   · 有响应的握手失败 ⇒ 对端进程活着、每敲一次它都记账 ⇒ 必须慢（封顶 600s）；
+    ///   · 零字节的握手失败 ⇒ 对端进程压根没 accept/没处理（连接待机、已退出）
+    ///     ⇒ 没有任何记账 ⇒ 可以快一点（封顶 120s），换来"对端一醒来就接上"。
+    /// `connectFailed` 会把两个都清零。
+    private var handshakeSilentStreak = 0
 
     /// 链路断开 / 恢复回调（GUI 用来更新状态与提示）。
     public var onLinkDown: ((String) -> Void)?
@@ -787,6 +935,14 @@ public final class MWBClient {
     /// - Note: 返回 `.success` 只代表"客户端已启动（监听在跑、重连循环在跑）"，
     ///   **不代表链路已建立**。要区分二者请读 `linkEstablished`。
     public func run(retryOnFirstFailure: Bool = true) -> Result<Void, MWBConnectionError> {
+        // ★ 已 `stop()` 的 Client 是**终态**，绝不允许复活 —— 复活就等于又造一条僵尸重连
+        //   循环（见 `stopped` 属性上的长注释）。调用方应当新建一个 `MWBClient`。
+        guard !stopped else {
+            log("[MWB] ✗ 该客户端已 stop()（终态）→ 拒绝再次 run()。请新建一个 MWBClient。")
+            return .failure(.connectFailed(NSError(
+                domain: "MWB", code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "客户端已停止（终态），不能复用"])))
+        }
         // 握手 + 注册已在此完成
         connection.onLog = { [weak self] s in self?.log("[MWB] \(s)") }
 
@@ -841,6 +997,8 @@ public final class MWBClient {
         }
         disarmConnectWatchdog()
         linkEstablished = true
+        // 刚握完手 ⇒ 静默计时从"现在"起算（否则会拿开机前的旧时刻去判，一上线就被判死）。
+        lastInboundAt = Date()
         log("[MWB] 握手阶段结束，进入运行态")
         startRuntimeIfNeeded()
         connection.startReceiveLoop()
@@ -941,6 +1099,50 @@ public final class MWBClient {
         startMouseSenderSupervisor()
         startFaultInjectionIfRequested()
         startReconnectFaultInjectionIfRequested()
+
+        // ★ 「顶到边缘时链路还活着吗」—— 注入给输入层。
+        //
+        // 【为什么必须有】2026-10-08 实测到一次"假交接"：11:21:20 我们已把主动连接
+        //   `fd=5` 关掉（正在重连），11:21:22 用户把鼠标顶到边缘，**控制权照样交了出去**，
+        //   紧接着就是 `⚠️ 发送失败 writeFailed`。对用户来说，这比"连不上"更难受 ——
+        //   本机光标不见了、对端却毫无反应，看着像 App 坏了。
+        //   链路没建立时就不该交出控制权。
+        input.linkAliveProbe = { [weak self] in
+            guard let self else { return false }
+            return self.linkEstablished && !self.linkDead
+        }
+
+        // ★ 入站静默看门狗：**半开连接**（对端主机在、应用被冻结/已退出）的唯一发现手段。
+        //   `SO_KEEPALIVE` 与写失败都发现不了它，见 `InboundSilence` 文件头的事故记录。
+        startInboundSilenceWatchdog()
+    }
+
+    // MARK: - 入站静默看门狗
+
+    /// 启动 1 秒一跳的静默检查。
+    ///
+    /// 跑在**主队列**：`handleLinkDead` 要求主线程（它要碰 UI 回调与重连状态机）。
+    private func startInboundSilenceWatchdog() {
+        guard inboundSilenceWatchdog == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(200))
+        t.setEventHandler { [weak self] in self?.checkInboundSilence() }
+        t.resume()
+        inboundSilenceWatchdog = t
+        log("[MWB] 入站静默看门狗已启动：阈值 \(Int(inboundSilenceTimeout))s"
+            + "（对端正常时持续发包；静默超过该时长即判定链路已废）")
+    }
+
+    private func checkInboundSilence() {
+        let ago = Date().timeIntervalSince(lastInboundAt)
+        guard InboundSilence.isStale(lastInboundAgo: ago,
+                                     linkEstablished: linkEstablished,
+                                     linkDead: linkDead,
+                                     timeout: inboundSilenceTimeout) else { return }
+        log("[MWB] ✗ " + InboundSilence.explain(silentFor: ago, timeout: inboundSilenceTimeout))
+        // 复用**完全相同**的降级路径（交回控制权 + 停鼠标发送线程 + 自动重连）。
+        // 不另立新路，是为了让「半开」与「读侧收到 EOF」这两种断链表现完全一致。
+        handleLinkDead("对端静默 \(Int(ago))s（半开连接）")
     }
 
     // MARK: - 跨屏文件传输
@@ -1699,6 +1901,20 @@ public final class MWBClient {
     ///   对端既不应答握手、也不做 FIN 收尾 —— 典型"以为会话还在"的表现。
     ///   PowerToys 自己在退出时是会 `SendByeBye` 的，我们对齐它。
     public func stop() {
+        // ★★ 第一件事：把它标成**终态** ★★
+        //
+        // 必须放在最前面（而不是等到末尾），因为下面每一句都可能触发回调：
+        //   · `connection.send(byeBye)` 失败 → `handleLinkDead`；
+        //   · `connection.close()` → 读侧 EOF → `onDisconnected` → `handleLinkDead`；
+        // 而 `handleLinkDead` 的下一步就是 `scheduleReconnect()`。
+        // 终态标志先落上，三处闸门（scheduleReconnect / retryNow / handleLinkDead）立刻生效，
+        // 才不会再出现"刚 stop 就又给自己排了一次重连"。
+        let alreadyStopped = stopped
+        stopped = true
+        if !alreadyStopped {
+            log("[MWB] 客户端已 stop()（终态）：不再重连、不再收包、不再持有资源")
+        }
+
         // ① 先停鼠标发送线程：否则 ByeBye 之后还可能冒出一帧过期位置，
         //    对端会看到一个"已经道别了还在动"的机器。
         stopMouseMoveSender()
@@ -1706,6 +1922,17 @@ public final class MWBClient {
         // 但留着一个每秒跑的空定时器没有意义（下次 run() 会重新起）。
         mouseSupervisor?.cancel()
         mouseSupervisor = nil
+
+        // ★ 时间源一并收掉：心跳 / 入站静默看门狗 / 连接阶段看门狗。
+        //   过去这三个没管 —— 已 stop 的 Client 会继续发心跳、继续判"对端静默"，
+        //   判死后调 `handleLinkDead`（现在被 `stopped` 闸住，但定时器本身也不该留着）。
+        //   这属于僵尸客户端的"资源尾巴"，一并清掉。
+        heartbeatSource?.cancel()
+        heartbeatSource = nil
+        inboundSilenceWatchdog?.cancel()
+        inboundSilenceWatchdog = nil
+        connectWatchdog?.cancel()
+        connectWatchdog = nil
 
         // 注销本 Client：**全部**连接都下线后守护才会撤下断言（把正常睡眠策略还给系统）。
         // 这里刻意不调 `standby.stop()` —— 启动时可能还有另一个 Client 在线，
@@ -1801,6 +2028,9 @@ public final class MWBClient {
     /// （出站主连 + Windows 回连进来的那条），剪贴板分片缓冲必须**按连接隔离**，
     /// 否则两条连接的分片会交错，且并发写同一数组会堆破坏（见 `ClipboardSync.batches`）。
     private func handle(_ p: DataPacket, from conn: MWBConnection) {
+        // ★★ 收到**任何**入站包就刷新静默计时器 —— 这是半开连接看门狗的唯一输入。
+        //    放在最前面：无论这个包后面走哪个分支、甚至解包失败，都说明"对端还活着"。
+        lastInboundAt = Date()
         noteInbound()      // 链路探针：用 MWB 自己的 TCP 流的到达节奏量链路抖动
         if verbose {
             log("[MWB] ← type=\(p.type) id=\(p.id) src=\(p.src) des=\(p.des) name='\(p.machineName)'")
@@ -2059,5 +2289,103 @@ public final class MWBClient {
             }
             log("[MWB] 未处理包类型 \(p.type) (src=\(p.src))")
         }
+    }
+
+    // MARK: - 自检：`stop()` 必须是终态（回归 2026-10-08 僵尸重连洪水）
+
+    /// 【它回答什么】调用 `stop()` 之后，这个 Client 到底还会不会偷偷重连？
+    ///
+    /// 【回归对象】`stop()` 过去用 `linkDead = true` 表达"停用"，而 `scheduleReconnect()`
+    ///   的延时块恰好用 `linkDead == true` 作为**放行**条件（`guard self.linkDead else { return }`）
+    ///   —— 两处语义撞车 ⇒ `stop()` 不但没停掉已排好的重连，反而正好给它放行。
+    ///   面板上每点一次「连接」都会 `connect()` 新建 Client 并 `stop()` 旧的，于是旧 Client
+    ///   变成**永不停止的僵尸重连循环**。实测（`/tmp/mwb_gui.log`）：13 次点击 → 12 条僵尸，
+    ///   12:25:17→12:30:57 共 **924** 次 TCP connect 尝试（≈2.3 次/秒）。
+    ///
+    /// 【判据】
+    ///   ① 首连失败后**必须真的进入重连循环**（否则这个自检就是空跑，测不出任何东西）；
+    ///   ② `stop()` 之后静置 12s（> 2 个探测周期），重连计数**一个都不许涨**；
+    ///   ③ 已 `stop()` 的 Client 再 `run()` 必须被拒（终态不可复活）。
+    ///
+    /// ⚠️ 端口技巧：先自己 `bind()` 一个 socket 但**不 `listen()`**。
+    ///   不这么做的话，Client 自己的回连监听会先绑上该端口，我们就会连到"自己"上
+    ///   造出一条假连接（握手上挂 8 秒），自检既慢又不确定。bind 不 listen ⇒
+    ///   对端内核直接回 RST ⇒ `connectFailed` 立刻返回。
+    public static func zombieStopSelfTest() -> Never {
+        let port: UInt16 = 54991
+
+        // 占位 socket：只 bind，不 listen。
+        let guardFD = socket(AF_INET, SOCK_STREAM, 0)
+        var reuse: Int32 = 1
+        _ = setsockopt(guardFD, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = INADDR_ANY
+        let bound = withUnsafePointer(to: &addr) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(guardFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if bound != 0 {
+            print("⚠️ 占位端口 \(port) bind 失败（errno=\(errno)）—— 若该端口恰好有人在监听，结论不可靠")
+        }
+
+        var pass = 0, total = 0
+        var fails: [String] = []
+        func check(_ ok: Bool, _ desc: String) {
+            total += 1
+            if ok { pass += 1 } else { fails.append(desc) }
+        }
+        func finish() {
+            if guardFD >= 0 { close(guardFD) }
+            print("僵尸重连自检（回归「stop() 之后旧 Client 仍在偷偷重连」）")
+            for f in fails { print("  ✗ \(f)") }
+            print("\n结果: \(pass)/\(total) 通过")
+            exit(fails.isEmpty ? 0 : 2)
+        }
+
+        let client = MWBClient(host: "127.0.0.1", port: port,
+                               securityKey: "zombie-selftest", machineName: "zombie-selftest")
+        let runResult = client.run()
+        var runOK = false
+        if case .success = runResult { runOK = true }
+        check(runOK, "首连失败时 run() 仍应返回 .success（语义=客户端已启动）")
+
+        let firstDeadline = Date().addingTimeInterval(8)
+        func waitForFirstAttempt() {
+            if client.reconnectAttemptsTotal < 1 && Date() < firstDeadline {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { waitForFirstAttempt() }
+                return
+            }
+            let before = client.reconnectAttemptsTotal
+            check(before >= 1,
+                  "首连失败后应真的进入重连循环（实测 \(before) 次；为 0 说明本自检在空跑）")
+
+            client.stop()
+
+            // 静置 12s（≥2 个 5s 轻量探测周期）。是僵尸的话这里必然继续涨。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                let after = client.reconnectAttemptsTotal
+                check(after == before,
+                      "stop() 之后不得再有任何重连尝试（stop 前 \(before) → stop 后 \(after)）")
+
+                var refused = false
+                if case .failure = client.run() { refused = true }
+                check(refused, "已 stop() 的 Client 再 run() 必须失败（终态不得复活）")
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    let after2 = client.reconnectAttemptsTotal
+                    check(after2 == before,
+                          "被拒的 run() 之后也不得重连（\(before) → \(after2)）")
+                    finish()
+                }
+            }
+        }
+        waitForFirstAttempt()
+
+        // 只跑主队列：本自检里的等待与 `scheduleReconnect()` 的延时块都走主队列。
+        dispatchMain()
     }
 }

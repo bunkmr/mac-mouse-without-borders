@@ -180,6 +180,23 @@ if args.count > 1 && args[1] == "--mouse-sender-supervisor-selftest" {
     exit(fails.isEmpty ? 0 : 2)
 }
 
+// ---- 入站静默判据（半开连接看门狗）：离线纯逻辑断言 ----
+//
+// 【回归对象】2026-10-08「Windows 睡眠恢复后 App 显示已连接、鼠标却跨不过去」。
+// 现场判据是 `nettop`：本连接的 `bytes_in` 冻结在 1296（只有握手那一轮的量）
+// 全程不涨，而 `bytes_out` 每 4 秒稳定 +64（我们自己的心跳）。
+// 也就是说 —— 对端主机还在（TCP ESTABLISHED、写也成功），但对端**应用**一个字都不回了。
+//
+// 判据写错的两个方向都是灾难：漏判 ⇒ 回到这次事故；误判 ⇒ 健康链路被反复掐断，
+// 而每次重连都要在对端连接账上记一笔，攒够 9 次会打出它的 `too many connections` 自我保护。
+if args.count > 1 && args[1] == "--inbound-silence-selftest" {
+    let (pass, total, fails) = InboundSilence.selfTest()
+    print("入站静默判据自测（回归「半开连接伪装成已连接」）")
+    for f in fails { print("  ✗ \(f)") }
+    print("\n结果: \(pass)/\(total) 通过")
+    exit(fails.isEmpty ? 0 : 2)
+}
+
 if args.count > 1 && args[1] == "--input-inject-race-selftest" {
     // 回归 2026-09-14 的 SIGSEGV：两条接收线程并发改 InputController 的远端注入状态
     // （栈 = Set._Variant.insert ← injectMouseButton ← MWBClient.handle）。
@@ -280,6 +297,15 @@ if args.count > 1 && args[1] == "--conn-reconnect-reset-selftest" {
     let ok = MWBConnection.reconnectResetSelfTest()
     print("\n结果: \(ok ? "通过" : "失败")")
     exit(ok ? 0 : 2)
+}
+
+if args.count > 1 && args[1] == "--zombie-stop-selftest" {
+    // 回归 2026-10-08「僵尸重连洪水」：MWBClient.stop() 用 linkDead = true 表示"停用"，
+    // 而 scheduleReconnect() 的延时块正是用 linkDead == true 放行重连 —— 语义撞车
+    // ⇒ stop() 没能停掉已排好的重连，反而给它放行。
+    // 面板每点一次「连接」就多一条僵尸循环：实测 13 次点击 = 12 条僵尸、~2.3 次 TCP connect/秒。
+    // 本自检会真的跑一遍"首连失败 → 进入重连 → stop() → 静置 12s"并比对计数（约 20 秒）。
+    MWBClient.zombieStopSelfTest()   // 内部 dispatchMain()，永不返回
 }
 
 if args.count > 1 && args[1] == "--standby-guard-selftest" {

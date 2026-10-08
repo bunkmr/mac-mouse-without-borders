@@ -63,9 +63,9 @@ Windows 上的「无界鼠标」只能让 Windows 电脑之间互联。这个程
 
 ### 第 1 步：下载
 
-👉 **前往 [Releases 页面](https://github.com/bunkmr/mac-mouse-without-borders/releases/latest) 下载 `MWB-v1.4.5-universal.dmg`**（约 2.4 MB）
+👉 **前往 [Releases 页面](https://github.com/bunkmr/mac-mouse-without-borders/releases/latest) 下载 `MWB-v1.4.6-universal.dmg`**（约 2.4 MB）
 
-也可以直接下仓库里的那份：[dist/MWB-v1.4.5-universal.dmg](dist/MWB-v1.4.5-universal.dmg)。
+也可以直接下仓库里的那份：[dist/MWB-v1.4.6-universal.dmg](dist/MWB-v1.4.6-universal.dmg)。
 
 ### 第 2 步：安装
 
@@ -149,6 +149,35 @@ xattr -dr com.apple.quarantine /Applications/MWB.app
 ---
 
 ## 更新记录
+
+### v1.4.6（2026-10-08）
+
+这一版修掉一个**最容易被误判成"App 坏了"**的问题：**Windows 睡一觉醒来，Mac 这边显示"已连接"，
+但鼠标推过去毫无反应、一推就被弹回来**。顺带挖掉一个会把对端打爆的重连缺陷。
+
+- 🐛 **修掉「Windows 睡眠恢复后显示已连接、鼠标却跨不过去」**。这是一种**半开连接**：
+  Windows 睡下去之后，它的**网卡和内核还在**（照常响应、TCP 连接看着完全健康），
+  但 **MWB 应用被冻结了** —— 于是：
+  - 我们发过去的包，Windows 内核照常确认 ⇒ **发送永远"成功"**，看不出异常；
+  - Windows 一个包都不回，而读侧是**阻塞等数据**的 ⇒ 接收线程一辈子不返回，**"断开"事件永远不触发**。
+
+  两道防线同时失效，所以面板一直显示"已连接"。现在补了**应用层看门狗**：
+  **15 秒内没有收到对端任何数据**就判定这条链路已废 ⇒ 立刻把控制权交回 Mac、主动断开重连。
+  同时加上 **TCP keepalive（10 秒闲置 / 5 秒间隔 / 3 次 ≈ 25 秒）**，
+  覆盖另一种情形：对端**主机整个消失**（拔网线 / 断电 / 路由器重启）。
+  两者互补 —— keepalive 探"主机在不在"，看门狗探"应用还答不答话"。
+
+- 🐛 **修掉「点几次『连接』就把对端打爆」**。这是个语义撞车的 bug：
+  「停用」和「可以重连」在代码里用了**同一个标志位**，导致 `stop()` 不但没停掉已排好的重连，
+  **反而给它放了行** —— 每点一次「连接」就留下一条永不停止的僵尸重连循环。
+  实测连点 13 次 → **12 条僵尸循环**、5 分钟内发出 **924 次** TCP 连接请求（约 2.3 次/秒）。
+  这正是对端偶尔报 `too many connections` / `invalidkey` 并自我退出的来源。
+  现在 `stop()` 是**真正的终态**，且重复点「连接」在配置未变时只会**立刻重试一次**，不再重建。
+
+- 🔧 **顶到屏幕边缘但链路尚未建立时，不再交出控制权**。以前会遇到「光标凭空消失、对端却毫无反应」
+  的假交接 —— 现在这种情况光标老老实实留在手上，最多觉得"跨不过去"。
+
+- 🔍 日志新增两条可自查的判据：`入站静默看门狗已启动：阈值 15s` 与 `keepalive=10s×3`。
 
 ### v1.4.5（2026-10-08）
 
@@ -422,7 +451,7 @@ no extra software needed on the Windows side.
 
 **Install**
 
-1. Download `dist/MWB-v1.4.5-universal.dmg`
+1. Download `dist/MWB-v1.4.6-universal.dmg`
 2. Drag `MWB.app` into `/Applications`
 3. The app is not notarized, so run once:
    ```bash

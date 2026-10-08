@@ -2609,6 +2609,22 @@ public final class InputController {
 
     // MARK: - 屏幕边缘切换状态机
 
+    /// 「链路现在活着吗」—— 由 `Client` 注入（`linkEstablished && !linkDead`）。
+    ///
+    /// 【为什么必须有这道闸】交出控制权 = **把本机光标藏起来**，并且把用户接下来所有输入
+    /// 都发往对端。链路没建立时这么做，用户看到的是「光标不见了、对端却毫无反应」——
+    /// 比单纯的"连不上"难受得多，还会被当成 App 坏了。
+    ///
+    /// 2026-10-08 实测到一次"假交接"：11:21:20 我们已经把主动连接 `fd=5` 关掉（正在重连），
+    /// 11:21:22 用户把鼠标顶到边缘，**控制权照样交了出去**，紧接着就是
+    /// `⚠️ 发送失败 writeFailed`，几秒后才被宽限逻辑退回本机。
+    ///
+    /// `nil` = 不做检查（自检与未注入时保持旧行为）。
+    public var linkAliveProbe: (() -> Bool)?
+
+    /// 「因链路未建立而拒绝交接」的日志节流（tap 回调是 1000Hz 级的，不能每次都打）。
+    private var lastLinkRefusedLogAt = Date.distantPast
+
     private func isPanicKey(_ event: CGEvent) -> Bool {
         let flags = event.flags
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
@@ -2643,6 +2659,18 @@ public final class InputController {
             }
             // 本机控制中：只有顶到指定边缘才交出控制权。
             if hasCrossedEdge(loc) {
+                // ★ 链路没建立就别交接（见 `linkAliveProbe` 说明）。
+                //   顶到边缘却什么都不发生时，用户最多觉得"跨不过去"，光标还在手上；
+                //   而"交出去但对面不动"会让光标凭空消失，是更坏的体验。
+                if let alive = linkAliveProbe, !alive() {
+                    if Date().timeIntervalSince(lastLinkRefusedLogAt) > 2 {
+                        lastLinkRefusedLogAt = Date()
+                        diag("[MWB] 已顶到 \(switchEdge) 边缘，但链路未建立 → 暂不交出控制权"
+                             + "（避免「光标藏了、对端却没反应」的假交接）")
+                    }
+                    lastLocalPoint = loc
+                    return Unmanaged.passUnretained(event)
+                }
                 enterRemote(at: loc)
                 return nil // 吞掉这一帧，本机光标停在边缘
             }
