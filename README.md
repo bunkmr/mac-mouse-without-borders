@@ -437,7 +437,7 @@ no extra software needed on the Windows side.
 
 - macOS **13.0 Ventura** or later (tested on macOS 15 Sequoia)
 - Universal binary: works on both **Apple Silicon** and **Intel** Macs
-- Windows 10 / 11 with Microsoft PowerToys (Mouse Without Borders)
+- Windows 10 / 11 with Microsoft PowerToys (Mouse Without Borders). See [protocol compatibility](docs/DEVELOPMENT.md#encryption).
 - Both machines on the same local network
 
 **Features**

@@ -42,10 +42,7 @@
 //    并按头里的字节数校验完整性。
 //
 // ------------------------------------------------------- 加密（复用主通道同一套）
-// 与本机 Windows 端一致：PBKDF2-HMAC-SHA1 / 固定 salt / 固定 IV，无明文 salt+IV 头，
-// 连接后先互发 16 字节预热块。见 Crypto.swift 顶部说明。
-// （注意：PowerToys 的 main 分支后来改成了「每流 32 字节明文 salt+IV + PBKDF2-SHA512/100000」，
-//   但本机对端不是那个版本 —— 以实测为准，与主通道保持完全一致。）
+// The clipboard channel uses the same fixed-salt protocol and PRF as the main channel.
 
 import Foundation
 import AppKit
@@ -192,6 +189,7 @@ public final class MWBClipboardChannel {
     public var magic: UInt16 = 0x3555
     /// 剪贴板通道端口 = TcpPort（主通道是 TcpPort + 1）。
     public let port: UInt16
+    var peerPRF: () -> MWBCrypto.LegacyPRF = { .sha1 }
 
     public var onLog: ((String) -> Void)?
     /// 收到对端推来的载荷后回调（Windows → Mac 方向）：文件 / 剪贴板图片 / 剪贴板文本。
@@ -460,7 +458,7 @@ public final class MWBClipboardChannel {
     /// 顺序不能颠倒 —— 双方都是先发后收，所以不会互相等死。
     private func shakeHand(fd: Int32, weAreDataHolder: Bool, post: MWBPostAction) -> Result<Session, MWBClipboardError> {
         let key: [UInt8]
-        switch MWBCrypto.deriveKey(securityKey: securityKey) {
+        switch MWBCrypto.deriveKey(securityKey: securityKey, using: peerPRF()) {
         case .success(let k): key = k
         case .failure(let e): return .failure(.ioFailed("密钥派生失败 \(e)"))
         }

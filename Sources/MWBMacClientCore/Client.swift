@@ -1170,6 +1170,7 @@ public final class MWBClient {
                                      machineName: connection.machineName,
                                      myID: connection.myID)
         ch.magic = connection.learnedMagic
+        ch.peerPRF = { [connection] in connection.legacyPRF }
         ch.onLog = { [weak self] s in self?.log(s) }
         ch.onPayloadReceived = { [weak self] payload in
             guard let self else { return }

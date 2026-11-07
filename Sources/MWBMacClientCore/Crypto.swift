@@ -5,8 +5,8 @@
 //   非来自社区文档的猜测，已实测可完成双向握手认证】
 //
 // 实测结论:
-//  - 密钥派生: PBKDF2-HMAC-**SHA1**(UTF8(安全密钥), salt, 50000 次) -> 32 字节 AES-256 key。
-//    注意是 SHA1 而非 SHA512 —— 这是社区文档普遍写错的地方（Satyam52/MWBMac 也用的 SHA512）。
+//  - Key derivation: PBKDF2-HMAC-SHA1 or PBKDF2-HMAC-SHA512 with 50,000 iterations.
+//    The main channel identifies the peer's variant from its first packet.
 //  - salt    : UTF16LE("18446744073709551615")，40 字节，固定。
 //  - IV      : ASCII("1844674407370955")，16 字节，固定。收发共用。
 //  - 无明文 salt/IV 头交换（PowerToys 新版的 32 字节头交换在此版本不存在）。
@@ -33,8 +33,20 @@ public enum MWBCrypto {
     public static let blockSize = 16
     /// PBKDF2 迭代次数（实测 50000）。
     public static let iterations = 50_000
-    /// 伪随机函数：实测为 HMAC-SHA1。
-    public static let prf = CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA1)
+    enum LegacyPRF: String, CaseIterable {
+        case sha1 = "SHA-1"
+        case sha512 = "SHA-512"
+
+        var algorithm: CCPseudoRandomAlgorithm {
+            switch self {
+            case .sha1: return CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA1)
+            case .sha512: return CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA512)
+            }
+        }
+    }
+
+    /// Default PRF for callers that derive keys without an established peer session.
+    public static let prf = LegacyPRF.sha1.algorithm
 
     // MARK: - 密钥派生
 
@@ -43,6 +55,13 @@ public enum MWBCrypto {
     public static func deriveKey(securityKey: String,
                                  salt: [UInt8] = MWBCrypto.legacySalt(),
                                  iterations: Int = MWBCrypto.iterations) -> Result<[UInt8], MWBCryptoError> {
+        deriveKey(securityKey: securityKey, salt: salt, iterations: iterations, using: .sha1)
+    }
+
+    static func deriveKey(securityKey: String,
+                          salt: [UInt8] = MWBCrypto.legacySalt(),
+                          iterations: Int = MWBCrypto.iterations,
+                          using prf: LegacyPRF) -> Result<[UInt8], MWBCryptoError> {
         let pw = Data(securityKey.utf8)
         guard !salt.isEmpty, !pw.isEmpty else { return .failure(.aesFailed) }
 
@@ -55,7 +74,7 @@ public enum MWBCrypto {
                     pw.count,
                     saltPtr.baseAddress!.assumingMemoryBound(to: UInt8.self),
                     salt.count,
-                    prf,
+                    prf.algorithm,
                     UInt32(iterations),
                     &derived,
                     derived.count
