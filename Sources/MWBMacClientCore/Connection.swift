@@ -3,8 +3,7 @@
 //
 // 【实测锁定】（针对真实 Windows 端抓包穷举所得）
 //  1. TCP 连接端口 15101（键鼠）/ 15100（剪贴板）。
-//  2. AES-256-CBC，key = PBKDF2-HMAC-SHA1(UTF8(安全密钥), UTF16LE("18446744073709551615"), 50000, 32)，
-//     IV = ASCII("1844674407370955")。收发同 key/IV，但各维护一条 CBC 链。
+//  2. AES-256-CBC with the fixed-salt legacy protocol. See Crypto.swift for key derivation.
 //  3. 无明文 salt/IV 头交换。连接建立后双方立刻互发一个 16 字节随机块预热 CBC 链，
 //     该块必须被消耗掉，否则后续所有包的解密全部错位。
 //  4. 握手: 发送 10 个 Handshake(126)（含随机 Machine1-4 挑战）；
@@ -106,6 +105,9 @@ public final class MWBConnection {
     /// 剪贴板通道（15100）要复用它：那边虽然不跑握手，但头包同样带上魔数保持一致。
     public var learnedMagic: UInt16 { magic }
 
+    private var _legacyPRF: MWBCrypto.LegacyPRF = .sha1
+    var legacyPRF: MWBCrypto.LegacyPRF { stateLock.withLock { _legacyPRF } }
+
     public init(host: String, port: UInt16, securityKey: String, machineName: String, myID: UInt32 = 0) {
         self.host = host
         self.port = port
@@ -117,6 +119,7 @@ public final class MWBConnection {
     // MARK: - 连接 + 握手
 
     public func connect() -> Result<Void, MWBConnectionError> {
+        sendLock.withLock { encryptCtx = nil }
         isClosed = false
         switch establishSocket() {
         case .failure(let e): return .failure(e)
@@ -138,39 +141,20 @@ public final class MWBConnection {
     /// 在已就绪的 socket 上跑完整加密握手（主动连接与被动接受都要走这套流程，
     /// 实测 MWB 两端行为对称：都是先发 16 字节预热块，再发 10 个 Handshake）。
     public func establishSession() -> Result<Void, MWBConnectionError> {
-        // 1) 密钥与 IV（实测：PBKDF2-SHA1 / 固定 salt / 固定 IV）
-        let key: [UInt8]
-        switch MWBCrypto.deriveKey(securityKey: securityKey) {
-        case .success(let k): key = k
-        case .failure(let e): return .failure(.cryptoError(e))
-        }
-        let iv = MWBCrypto.legacyIV()
-        encryptCtx = CBCContext(key: key, iv: iv)
-        decryptCtx = CBCContext(key: key, iv: iv)
+        guard !securityKey.isEmpty else { return .failure(.cryptoError(.aesFailed)) }
 
         if myID == 0 { myID = UInt32.random(in: 1...UInt32.max - 1) }
         if myID == 255 { myID = 1 }
 
-        // ★ IV 用**十六进制**打。以前这里用 `String(decoding: iv, as: UTF8.self)`，
-        //   而 legacyIV 恰好是一串可打印 ASCII，于是日志里显示成 `IV=1844674407370955`
-        //   —— 看上去像个天文数字，排查时极易误读。hex 才是一眼可核对的形态。
-        let keyHex = key.prefix(8).map { String(format: "%02x", $0) }.joined()
-        let ivHex = iv.map { String(format: "%02x", $0) }.joined()
-        log("[连接] socket 就绪; AES key=\(keyHex)… IV=0x\(ivHex)")
-
-        // 2) 虚拟 16 字节块：预热 CBC 链（对端也会发，后面接收时要消耗掉）
-        let dummy = MWBCrypto.randomBytes(16)
-        switch encryptCtx!.encrypt(dummy) {
-        case .failure(let e): return .failure(.cryptoError(e))
-        case .success(let ct):
-            switch writeRaw(ct) { case .failure(let e): return .failure(e); case .success: break }
-        }
+        // The peer discards the first plaintext block. Any random ciphertext block
+        // has the same wire format and becomes the IV for the next CBC block.
+        let outgoingWarmup = MWBCrypto.randomBytes(MWBCrypto.blockSize)
+        if case .failure(let error) = writeRaw(outgoingWarmup) { return .failure(error) }
         log("[连接] 已发送 CBC 预热块")
 
-        // 3) 握手（内部完成 magic 自校准）
-        switch doHandshake() {
-        case .failure(let e): return .failure(e)
-        case .success: break
+        switch doHandshake(outgoingWarmup: outgoingWarmup) {
+        case .failure(let error): return .failure(error)
+        case .success(let prf): stateLock.withLock { _legacyPRF = prf }
         }
 
         // 4) 注册：广播 HeartbeatEx
@@ -186,41 +170,50 @@ public final class MWBConnection {
 
     private func log(_ s: String) { onLog?(s) }
 
-    private func doHandshake() -> Result<Void, MWBConnectionError> {
+    private func doHandshake(outgoingWarmup: [UInt8]) -> Result<MWBCrypto.LegacyPRF, MWBConnectionError> {
         setRecvTimeout(seconds: 8)
         defer { setRecvTimeout(seconds: 0) }
         lastHandshakeSawNoData = false
 
-        guard let dec = decryptCtx else { return .failure(.cryptoError(.aesFailed)) }
-
-        // 3a) 消耗对端的 16 字节预热块
-        //
-        // ★ 这一读成不成功，是区分两种**完全不同**故障的唯一判据（2026-09-14 踩坑记录）：
-        //    （甲）对端一个字节都没发 → 对端要么残留了半开会话（我们上次退出没发 ByeBye）、
-        //          要么根本没在跑 MWB、要么端口被别的程序占着；
-        //    （乙）对端发了字节、但解密成乱码 → 才是真正的「安全密钥不对」。
-        // 以前的代码两种情况都打「安全密钥不正确」，把排查方向直接引到密钥上，
-        // 白查了一轮 —— 所以这里必须分开报，并且明确说「这不是密钥问题」。
-        switch readRaw(16) {
-        case .failure:
-            // ★ 记下"零字节"这个事实：它把这次失败归到"对端进程没在处理"那一类，
-            //   上层的退避会据此走中等档（见 `lastHandshakeSawNoData` 的说明）。
+        guard case .success(let incomingWarmup) = readRaw(MWBCrypto.blockSize) else {
             lastHandshakeSawNoData = true
-            log("[握手] ✗ 对端在超时内**没有发送任何数据**（未读到 16 字节预热块）")
-            log("[握手]    → 这不是密钥问题。常见原因：① 对端残留了半开会话"
-                + "（我们上次退出时没发 ByeBye）② 对端 MWB 没在运行 ③ 对端 \(port) 被别的程序占着"
-                + " ④ 对端主机进入了睡眠/连接待机（网卡还在、应用被冻结）")
+            log("[握手] Peer CBC warmup block missing")
             return .failure(.handshakeFailed)
-        case .success(let blk):
-            _ = dec.decrypt(blk)
         }
 
-        // 3b) 读首个包，仅用 checksum 判定 -> 自校准 magic
-        //     预热块既然读到了，说明对端在正常说话；此时 checksum 不过才是真的密钥/协议不匹配。
-        guard let first = receiveRawPacket(), MWBCrypto.checksumValid(first) else {
-            log("[握手] 首包 checksum 校验失败 —— 安全密钥不正确或对方并非 MWB")
+        // Both supported first packet types occupy 64 bytes. Read the wire bytes
+        // once so both candidate keys see the same packet and CBC state.
+        guard case .success(let ciphertext) = readRaw(DataPacket.bigSize) else {
+            log("[握手] Incomplete initial handshake packet")
             return .failure(.handshakeFailed)
         }
+        var first: [UInt8]?
+        var selectedPRF: MWBCrypto.LegacyPRF?
+        for prf in MWBCrypto.LegacyPRF.allCases {
+            let key: [UInt8]
+            switch MWBCrypto.deriveKey(securityKey: securityKey, using: prf) {
+            case .success(let derived): key = derived
+            case .failure(let error): return .failure(.cryptoError(error))
+            }
+
+            let incoming = CBCContext(key: key, iv: incomingWarmup)
+            guard case .success(let plaintext) = incoming.decrypt(ciphertext),
+                  MWBCrypto.checksumValid(plaintext) else { continue }
+            let type = PackageType(rawValue: UInt32(plaintext[0]))
+            // The bundled CLI test peer starts with a HeartbeatEx.
+            guard type == .handshake || type == .heartbeatEx else { continue }
+
+            first = plaintext
+            selectedPRF = prf
+            decryptCtx = incoming
+            sendLock.withLock { encryptCtx = CBCContext(key: key, iv: outgoingWarmup) }
+            break
+        }
+        guard let first, let selectedPRF else {
+            log("[握手] Initial packet validation failed. Check the pairing key and peer protocol version.")
+            return .failure(.handshakeFailed)
+        }
+        log("[握手] PBKDF2-HMAC-\(selectedPRF.rawValue)")
         magic = MWBCrypto.readMagic(first)
         magicLearned = true
         log("[握手] magic 自校准成功 = 0x\(String(magic, radix: 16)) (来自对端)")
@@ -253,7 +246,7 @@ public final class MWBConnection {
             if case .failure(let e) = handleHandshakePacket(p, our: (expect1, expect2, expect3, expect4)) {
                 if case .handshakeFailed = e { log("[握手] 首个包处理异常") ; return .failure(e) }
             } else if handshakeDone {
-                return .success(())
+                return .success(selectedPRF)
             }
         }
 
@@ -270,9 +263,9 @@ public final class MWBConnection {
             var b = buf2
             MWBCrypto.clearStamp(&b)
             guard let p = DataPacket.parse(b) else { continue }
-            if handshakeDone { return .success(()) }
+            if handshakeDone { return .success(selectedPRF) }
             _ = handleHandshakePacket(p, our: (expect1, expect2, expect3, expect4))
-            if handshakeDone { return .success(()) }
+            if handshakeDone { return .success(selectedPRF) }
         }
         return .failure(.handshakeFailed)
     }

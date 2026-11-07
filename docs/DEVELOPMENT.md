@@ -16,7 +16,7 @@
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| TCP 连接 + 加密握手 | ✅ | 实测 legacy 方案：AES-256-CBC，PBKDF2-HMAC-**SHA1**(50000)，**固定** salt/IV，无明文 salt+IV 头 |
+| TCP 连接 + 加密握手 | ✅ | Fixed-salt AES-256-CBC. See [Encryption](#encryption) for key derivation. |
 | 包编解码 (32/64 字节) | ✅ | 逐字节对齐 PowerToys `App/Core`；4 字节 `Type`、16 字节联合区、32 字节机器名 |
 | 鼠标注入 (移动/按键/滚轮) | ✅ | `CGEventPost`（需辅助功能/输入监控授权） |
 | 键盘注入 | ✅ | Windows VK → Mac keycode 映射 |
@@ -43,12 +43,11 @@
 - **主通道 = `TcpPort + 1`**（本机为 **15101**）：握手、键鼠、心跳、剪贴板文本、**拖放信令**。
 - **剪贴板/文件通道 = `TcpPort`**（本机为 **15100**，即主通道 − 1）：`Clipboard.ShakeHand` + 文件字节。
 
-### 加密（见 `Crypto.swift` 顶部）
-- 密钥 = `PBKDF2-HMAC-SHA1(UTF8(安全密钥), UTF16LE("18446744073709551615"), 50000) → 32B AES-256`。
-  （注意是 **SHA1/50000**，社区文档常写成 SHA512/100000，那是新版尚未发布的方案。）
-- IV = ASCII `"1844674407370955"`，固定，收发共用；**没有**明文 salt+IV 头交换。
-- 连接建立后先互发 **16 字节随机块**预热 CBC 链，之后首包才开始。
-- AES-256-CBC，无填充；**链式状态跨包连续**（每个方向各一条链，对齐 .NET `CryptoStream`）。
+### Encryption
+
+- The fixed-salt protocol uses AES-256-CBC with no padding. Each direction has a continuous CBC chain, initialized by a 16-byte warmup block.
+- PBKDF2 takes the UTF-8 pairing key and fixed UTF-16LE salt from `Crypto.swift` and runs 50,000 iterations. The main channel validates the peer's first packet to select HMAC-SHA-1 or HMAC-SHA-512. The clipboard channel uses the PRF from the authenticated main connection.
+- PowerToys 0.100.x uses the fixed-salt SHA-512 variant. PowerToys 0.101 introduced a separate wire format with a per-stream salt and IV header and 100,000 iterations. This client supports the fixed-salt wire format.
 
 ### 包结构
 ```
